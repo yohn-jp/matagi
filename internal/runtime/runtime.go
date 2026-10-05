@@ -86,8 +86,9 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 	if snapshot == nil || client == nil || manager == nil {
 		return nil, errors.New("registry, SSH client and tunnel manager are required")
 	}
-	r := &Runtime{registry: snapshot, ssh: client, bindings: map[string]binding{}, services: map[string]registry.Service{}, tunnels: manager, pending: map[string]string{}, httpClient: &http.Client{Timeout: probeTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	r := &Runtime{registry: snapshot, ssh: client, bindings: map[string]binding{}, services: map[string]registry.Service{}, tunnels: manager, pending: map[string]string{}, httpClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	targets := []health.EnvironmentTarget{}
+	observerProbeTimeout := probeTimeout
 	for _, env := range snapshot.Environments() {
 		ex := executor{client: client, host: env.SSHHost}
 		opts := jinushi.Options{StateDir: env.Jinushi.StateDir, SupervisorStartCommand: env.Jinushi.SupervisorStartCommand, CommandTimeout: commandTimeout}
@@ -104,6 +105,10 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 		targets = append(targets, health.EnvironmentTarget{ID: string(env.ID)})
 	}
 	for _, service := range snapshot.Services() {
+		configuredTimeout := time.Duration(*service.Health.TimeoutMS) * time.Millisecond
+		if configuredTimeout >= observerProbeTimeout {
+			observerProbeTimeout = configuredTimeout + time.Second
+		}
 		e, s := string(service.EnvironmentID), string(service.ID)
 		r.services[key(e, s)] = service
 		for i := range targets {
@@ -117,7 +122,7 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 			}
 		}
 	}
-	observer, err := health.New(targets, health.Probes{Connectivity: r.connectivity, Process: r.process, Readiness: r.readiness, Endpoint: r.endpointState}, health.Options{PollInterval: 5 * time.Second, ProbeTimeout: probeTimeout})
+	observer, err := health.New(targets, health.Probes{Connectivity: r.connectivity, Process: r.process, Readiness: r.readiness, Endpoint: r.endpointState}, health.Options{PollInterval: 5 * time.Second, ProbeTimeout: observerProbeTimeout})
 	if err != nil {
 		return nil, err
 	}
@@ -238,10 +243,14 @@ func (r *Runtime) Ensure(ctx context.Context, env, id, endpoint string) (Endpoin
 }
 func (r *Runtime) connectivity(ctx context.Context, env string) (health.ConnectivityState, error) {
 	_, err := r.ssh.Run(ctx, r.bindings[env].environment.SSHHost, []string{"true"}, probeTimeout)
-	if err != nil {
+	if err == nil {
+		return health.ConnectivityConnected, nil
+	}
+	var transportErr *ssh.Error
+	if errors.As(err, &transportErr) && transportErr.Kind == ssh.FailureTransport {
 		return health.ConnectivityUnreachable, nil
 	}
-	return health.ConnectivityConnected, nil
+	return health.ConnectivityError, err
 }
 func (r *Runtime) process(ctx context.Context, env, id string) (health.ProcessState, error) {
 	s := r.services[key(env, id)]
