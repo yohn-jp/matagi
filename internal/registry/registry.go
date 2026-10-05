@@ -22,8 +22,17 @@ type ServiceID string
 type EndpointID string
 
 type Environment struct {
-	ID      EnvironmentID `json:"id"`
-	SSHHost string        `json:"sshHost"`
+	ID      EnvironmentID     `json:"id"`
+	SSHHost string            `json:"sshHost"`
+	Jinushi JinushiDefinition `json:"jinushi"`
+}
+
+// JinushiDefinition contains the environment-specific configuration required
+// to construct Jinushi client options. SupervisorStartCommand preserves the
+// configured argv boundaries used to start the remote supervisor.
+type JinushiDefinition struct {
+	StateDir               string   `json:"stateDir,omitempty"`
+	SupervisorStartCommand []string `json:"supervisorStartCommand"`
 }
 
 type DesiredState string
@@ -37,11 +46,12 @@ type ExecutionLifetime string
 
 const LifetimeDetached ExecutionLifetime = "detached"
 
-// ExecutionIntent preserves argv boundaries for Jinushi. CWD is omitted when
-// empty; runtime run and submission identities are deliberately not stored.
+// ExecutionIntent preserves argv boundaries and the explicit working
+// directory required by Jinushi. Runtime run and submission identities are
+// deliberately not stored.
 type ExecutionIntent struct {
 	Argv     []string          `json:"argv"`
-	CWD      string            `json:"cwd,omitempty"`
+	CWD      string            `json:"cwd"`
 	Lifetime ExecutionLifetime `json:"lifetime"`
 }
 
@@ -125,9 +135,7 @@ type Snapshot struct {
 
 // NewSnapshot validates and canonicalizes one complete registry document.
 func NewSnapshot(environments []Environment, services []Service) (*Snapshot, error) {
-	environmentCopies := make([]Environment, len(environments))
-	copy(environmentCopies, environments)
-	environments = environmentCopies
+	environments = cloneEnvironments(environments)
 	services = cloneServices(services)
 
 	seenEnvironments := make(map[EnvironmentID]struct{}, len(environments))
@@ -141,6 +149,9 @@ func NewSnapshot(environments []Environment, services []Service) (*Snapshot, err
 		seenEnvironments[environment.ID] = struct{}{}
 		if strings.TrimSpace(environment.SSHHost) == "" || environment.SSHHost != strings.TrimSpace(environment.SSHHost) || strings.HasPrefix(environment.SSHHost, "-") || strings.ContainsAny(environment.SSHHost, " \t\r\n\x00") {
 			return nil, fmt.Errorf("environment %q has an invalid OpenSSH host target", environment.ID)
+		}
+		if err := validateJinushiDefinition(environment.ID, environment.Jinushi); err != nil {
+			return nil, err
 		}
 	}
 
@@ -216,11 +227,26 @@ func validateExecution(serviceID ServiceID, execution ExecutionIntent) error {
 			return fmt.Errorf("service %q execution argv[%d] is invalid", serviceID, i)
 		}
 	}
-	if strings.ContainsRune(execution.CWD, '\x00') {
-		return fmt.Errorf("service %q execution cwd is invalid", serviceID)
+	if strings.TrimSpace(execution.CWD) == "" || execution.CWD != strings.TrimSpace(execution.CWD) || strings.ContainsRune(execution.CWD, '\x00') {
+		return fmt.Errorf("service %q execution cwd must be non-empty, trimmed, and NUL-free", serviceID)
 	}
 	if execution.Lifetime != LifetimeDetached {
 		return fmt.Errorf("service %q execution lifetime must be %q", serviceID, LifetimeDetached)
+	}
+	return nil
+}
+
+func validateJinushiDefinition(environmentID EnvironmentID, definition JinushiDefinition) error {
+	if strings.ContainsRune(definition.StateDir, '\x00') {
+		return fmt.Errorf("environment %q Jinushi state directory cannot contain NUL", environmentID)
+	}
+	if len(definition.SupervisorStartCommand) == 0 {
+		return fmt.Errorf("environment %q Jinushi supervisor start command must not be empty", environmentID)
+	}
+	for i, arg := range definition.SupervisorStartCommand {
+		if arg == "" || (i == 0 && strings.TrimSpace(arg) == "") || strings.ContainsRune(arg, '\x00') {
+			return fmt.Errorf("environment %q Jinushi supervisor start command argv[%d] is invalid", environmentID, i)
+		}
 	}
 	return nil
 }
@@ -275,9 +301,7 @@ func (s *Snapshot) Environments() []Environment {
 	if s == nil {
 		return nil
 	}
-	environments := make([]Environment, len(s.environments))
-	copy(environments, s.environments)
-	return environments
+	return cloneEnvironments(s.environments)
 }
 
 func (s *Snapshot) Services() []Service {
@@ -294,6 +318,15 @@ func cloneServices(services []Service) []Service {
 		cloned[i].Execution.Argv = append([]string{}, service.Execution.Argv...)
 		cloned[i].Health = cloneHealth(service.Health)
 		cloned[i].Endpoints = append([]Endpoint{}, service.Endpoints...)
+	}
+	return cloned
+}
+
+func cloneEnvironments(environments []Environment) []Environment {
+	cloned := make([]Environment, len(environments))
+	copy(cloned, environments)
+	for i := range cloned {
+		cloned[i].Jinushi.SupervisorStartCommand = append([]string{}, environments[i].Jinushi.SupervisorStartCommand...)
 	}
 	return cloned
 }

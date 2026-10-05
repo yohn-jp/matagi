@@ -12,8 +12,21 @@ import (
 
 func configFixture(reverse bool) *registry.Snapshot {
 	environments := []registry.Environment{
-		{ID: "dev-b", SSHHost: "dev-b"},
-		{ID: "dev-a", SSHHost: "dev-a"},
+		{
+			ID:      "dev-b",
+			SSHHost: "dev-b",
+			Jinushi: registry.JinushiDefinition{
+				SupervisorStartCommand: []string{"jinushi-start", "dev b"},
+			},
+		},
+		{
+			ID:      "dev-a",
+			SSHHost: "dev-a",
+			Jinushi: registry.JinushiDefinition{
+				StateDir:               " /srv/jinushi state ",
+				SupervisorStartCommand: []string{"systemctl", "--user", "start jinushi"},
+			},
+		},
 	}
 	services := []registry.Service{
 		{
@@ -22,6 +35,7 @@ func configFixture(reverse bool) *registry.Snapshot {
 			DesiredState:  registry.DesiredStopped,
 			Execution: registry.ExecutionIntent{
 				Argv:     []string{"/usr/bin/worker", "--label", "two words"},
+				CWD:      "/srv/worker",
 				Lifetime: registry.LifetimeDetached,
 			},
 			Health:    registry.HealthDefinition{Type: registry.HealthHTTP, EndpointID: "metrics", Path: "/ready"},
@@ -94,6 +108,9 @@ func TestStoreRoundTripsDeterministically(t *testing.T) {
 	if string(firstBytes) != string(secondBytes) {
 		t.Fatalf("registry encoding is not deterministic:\n%s\n---\n%s", firstBytes, secondBytes)
 	}
+	if strings.Contains(string(firstBytes), `"stateDir"`) == false || strings.Contains(string(firstBytes), `"start jinushi"`) == false || strings.Contains(string(firstBytes), `"dev b"`) == false {
+		t.Fatalf("registry document did not preserve typed Jinushi settings and argv boundaries:\n%s", firstBytes)
+	}
 	for _, forbidden := range []string{"privateKey", "password", "runId", "generation", "pid", "localPort", "healthResult"} {
 		if strings.Contains(string(firstBytes), forbidden) {
 			t.Fatalf("registry document contains forbidden field %q", forbidden)
@@ -122,8 +139,8 @@ func TestLoadRejectsCorruptUnsupportedAndSecretFields(t *testing.T) {
 		{name: "unsupported version", data: `{"version":2,"environments":[],"services":[]}`},
 		{name: "trailing value", data: `{"version":1,"environments":[],"services":[]} {}`},
 		{name: "unknown authentication field", data: `{"version":1,"sshPrivateKey":"secret","environments":[],"services":[]}`},
-		{name: "null optional health field", data: `{"version":1,"environments":[{"id":"dev","sshHost":"dev"}],"services":[{"id":"app","environmentId":"dev","desiredState":"running","execution":{"argv":["app"],"lifetime":"detached"},"health":{"type":"http","endpointId":"web","path":"/ready","method":null},"endpoints":[{"id":"web","label":"Web","remoteAddress":"127.0.0.1","remotePort":8080}]}]}`},
-		{name: "invalid registry", data: `{"version":1,"environments":[{"id":"dev","sshHost":"dev"}],"services":[{"id":"app","environmentId":"dev","desiredState":"running","execution":{"argv":[],"lifetime":"detached"},"health":{"type":"http","endpointId":"web","path":"/ready"},"endpoints":[{"id":"web","label":"Web","remoteAddress":"127.0.0.1","remotePort":8080}]}]}`},
+		{name: "null optional health field", data: `{"version":1,"environments":[{"id":"dev","sshHost":"dev","jinushi":{"supervisorStartCommand":["jinushi-start"]}}],"services":[{"id":"app","environmentId":"dev","desiredState":"running","execution":{"argv":["app"],"cwd":"/srv/app","lifetime":"detached"},"health":{"type":"http","endpointId":"web","path":"/ready","method":null},"endpoints":[{"id":"web","label":"Web","remoteAddress":"127.0.0.1","remotePort":8080}]}]}`},
+		{name: "invalid registry", data: `{"version":1,"environments":[{"id":"dev","sshHost":"dev","jinushi":{"supervisorStartCommand":["jinushi-start"]}}],"services":[{"id":"app","environmentId":"dev","desiredState":"running","execution":{"argv":[],"cwd":"/srv/app","lifetime":"detached"},"health":{"type":"http","endpointId":"web","path":"/ready"},"endpoints":[{"id":"web","label":"Web","remoteAddress":"127.0.0.1","remotePort":8080}]}]}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

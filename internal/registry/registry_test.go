@@ -6,18 +6,25 @@ import (
 )
 
 func registryFixture() ([]Environment, []Service) {
-	return []Environment{{ID: "dev", SSHHost: "dev-host"}}, []Service{{
-		ID:            "dashboard",
-		EnvironmentID: "dev",
-		DesiredState:  DesiredRunning,
-		Execution: ExecutionIntent{
-			Argv:     []string{"/opt/dashboard", "--port", "8080"},
-			CWD:      "/srv/dashboard",
-			Lifetime: LifetimeDetached,
-		},
-		Health:    HealthDefinition{Type: HealthHTTP, EndpointID: "web", Path: "/ready"},
-		Endpoints: []Endpoint{{ID: "web", Label: "Dashboard", RemoteAddress: RemoteLoopbackAddress, RemotePort: 8080}},
-	}}
+	return []Environment{{
+			ID:      "dev",
+			SSHHost: "dev-host",
+			Jinushi: JinushiDefinition{
+				StateDir:               "/srv/jinushi",
+				SupervisorStartCommand: []string{"systemctl", "--user", "start", "jinushi"},
+			},
+		}}, []Service{{
+			ID:            "dashboard",
+			EnvironmentID: "dev",
+			DesiredState:  DesiredRunning,
+			Execution: ExecutionIntent{
+				Argv:     []string{"/opt/dashboard", "--port", "8080"},
+				CWD:      "/srv/dashboard",
+				Lifetime: LifetimeDetached,
+			},
+			Health:    HealthDefinition{Type: HealthHTTP, EndpointID: "web", Path: "/ready"},
+			Endpoints: []Endpoint{{ID: "web", Label: "Dashboard", RemoteAddress: RemoteLoopbackAddress, RemotePort: 8080}},
+		}}
 }
 
 func TestNewSnapshotRejectsInvalidDefinitions(t *testing.T) {
@@ -30,6 +37,30 @@ func TestNewSnapshotRejectsInvalidDefinitions(t *testing.T) {
 		}},
 		{name: "invalid ssh target", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
 			envs[0].SSHHost = "-oProxyCommand=unsafe"
+			return envs, services
+		}},
+		{name: "missing supervisor start command", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			envs[0].Jinushi.SupervisorStartCommand = nil
+			return envs, services
+		}},
+		{name: "empty supervisor executable", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			envs[0].Jinushi.SupervisorStartCommand[0] = ""
+			return envs, services
+		}},
+		{name: "blank supervisor executable", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			envs[0].Jinushi.SupervisorStartCommand[0] = "  "
+			return envs, services
+		}},
+		{name: "empty supervisor argument", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			envs[0].Jinushi.SupervisorStartCommand[1] = ""
+			return envs, services
+		}},
+		{name: "NUL in supervisor argument", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			envs[0].Jinushi.SupervisorStartCommand[1] = "--user\x00start"
+			return envs, services
+		}},
+		{name: "NUL in state directory", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			envs[0].Jinushi.StateDir = "/srv/jinushi\x00other"
 			return envs, services
 		}},
 		{name: "unknown environment", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
@@ -49,6 +80,22 @@ func TestNewSnapshotRejectsInvalidDefinitions(t *testing.T) {
 		}},
 		{name: "empty argv element", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
 			services[0].Execution.Argv[1] = ""
+			return envs, services
+		}},
+		{name: "missing cwd", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			services[0].Execution.CWD = ""
+			return envs, services
+		}},
+		{name: "blank cwd", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			services[0].Execution.CWD = "  "
+			return envs, services
+		}},
+		{name: "untrimmed cwd", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			services[0].Execution.CWD = " /srv/dashboard"
+			return envs, services
+		}},
+		{name: "NUL in cwd", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			services[0].Execution.CWD = "/srv/dashboard\x00other"
 			return envs, services
 		}},
 		{name: "non-detached execution", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
@@ -135,12 +182,22 @@ func TestNewSnapshotDefaultsCanonicalOrderAndDefensiveCopies(t *testing.T) {
 	if got.Endpoints[0].ID != "logs" || got.Endpoints[1].ID != "web" {
 		t.Fatalf("endpoint order = [%s %s], want [logs web]", got.Endpoints[0].ID, got.Endpoints[1].ID)
 	}
+	if gotEnvironments := snapshot.Environments(); len(gotEnvironments) != 1 || gotEnvironments[0].Jinushi.StateDir != "/srv/jinushi" || strings.Join(gotEnvironments[0].Jinushi.SupervisorStartCommand, "|") != "systemctl|--user|start|jinushi" {
+		t.Fatalf("Jinushi definition was not preserved: %#v", gotEnvironments)
+	}
 
 	got.Execution.Argv[0] = "changed"
 	got.Endpoints[0].Label = "changed"
 	*got.Health.Method = "changed"
 	if again := snapshot.Services()[0]; again.Execution.Argv[0] != "/opt/dashboard" || again.Endpoints[0].Label != "Logs" || *again.Health.Method != "GET" {
 		t.Fatalf("snapshot was mutated through accessor: %#v", again)
+	}
+
+	environments[0].Jinushi.SupervisorStartCommand[0] = "changed at source"
+	returnedEnvironments := snapshot.Environments()
+	returnedEnvironments[0].Jinushi.SupervisorStartCommand[0] = "changed at accessor"
+	if again := snapshot.Environments()[0]; again.Jinushi.SupervisorStartCommand[0] != "systemctl" {
+		t.Fatalf("snapshot Jinushi definition was mutated through a source or accessor slice: %#v", again)
 	}
 }
 
