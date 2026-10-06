@@ -177,13 +177,13 @@ func TestPreflightChecksRuntimeBeforeInstance(t *testing.T) {
 	p := &preflightPlatform{}
 	_, release, err := Preflight(p)
 	if !errors.Is(err, ErrWebView2Missing) || release != nil || p.acquired {
-		t.Fatalf("missing runtime: release=%v err=%v acquired=%v", release, err, p.acquired)
+		t.Fatalf("missing runtime: release=%v err=%v acquired=%v", release != nil, err, p.acquired)
 	}
 
 	p.version = "1.0"
 	version, release, err := Preflight(p)
 	if err != nil || version != "1.0" || release == nil || !p.acquired {
-		t.Fatalf("preflight: version=%q release=%v err=%v acquired=%v", version, release, err, p.acquired)
+		t.Fatalf("preflight: version=%q release=%v err=%v acquired=%v", version, release != nil, err, p.acquired)
 	}
 	release()
 }
