@@ -7,3 +7,12 @@ Hosted Windows evidence is **not** physical or real-host certification. The test
 The portable shards cover production executable startup/shutdown, local API/UI presentation, bounded failure presentation, system OpenSSH configuration lookup, navigation policy, and a successful lifecycle/tunnel scenario. The lifecycle shard starts the exact candidate with a validated fixture registry and an executable-compatible deterministic SSH boundary fixture. It proves Matagi emits the expected Jinushi and `ssh -N -T -o ExitOnForwardFailure=yes -L ...` operations, establishes a loopback-only tunnel to a local fixture endpoint, exercises start/restart/stop through the UI/API surface, and proves Matagi-owned tunnel cleanup after stop.
 
 The deterministic fixture is hosted-runner evidence for Matagi's Windows orchestration boundary only. It is not evidence that a real OpenSSH server, Jinushi installation, development host, Inari, or Yokodori behaves correctly; that evidence remains exclusively in #19.
+
+
+## Desktop ownership
+
+The portable Windows matrix also launches the certified executable twice under
+the same Windows user. The second launch must activate the existing native
+window and exit without composing a second Matagi runtime or tunnel authority.
+This is a Windows-side ownership check only; it does not certify a real remote
+Jinushi or development host.
