@@ -91,9 +91,10 @@ type shell struct {
 	guard        *navigationGuard
 	closeOnce    sync.Once
 	initializing bool
-	quitPending  bool
-	closed       bool
-	activateMsg  uint32
+	quitPending     bool
+	activatePending bool
+	closed          bool
+	activateMsg     uint32
 }
 
 type native struct{}
@@ -324,6 +325,13 @@ func (native) Open(ctx context.Context, w Window) error {
 	if s.controller == nil {
 		return errors.New("WebView2 did not create a controller")
 	}
+	if s.activatePending {
+		s.activatePending = false
+		procShowWindow.Call(hwnd, swShowNormal)
+		procSetForegroundW.Call(hwnd)
+		c.Resize()
+		c.Focus()
+	}
 	webview, err := s.controller.GetCoreWebView2()
 	if err != nil {
 		return fmt.Errorf("getting the WebView2 surface: %w", err)
@@ -391,6 +399,10 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 		if s.activateMsg != 0 && uint32(message) == s.activateMsg {
 			procShowWindow.Call(hwnd, swShowNormal)
 			procSetForegroundW.Call(hwnd)
+			if s.initializing || s.controller == nil {
+				s.activatePending = true
+				return 0
+			}
 			if s.chromium != nil {
 				s.chromium.Resize()
 				s.chromium.Focus()
