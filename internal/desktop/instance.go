@@ -13,3 +13,8 @@ func InstanceName(userID string) string {
 	sum := sha256.Sum256([]byte("matagi-desktop\x00" + userID))
 	return instancePrefix + hex.EncodeToString(sum[:12])
 }
+
+func ActivateMessageName(userID string) string {
+	sum := sha256.Sum256([]byte("matagi-desktop-activate\x00" + userID))
+	return "Matagi.Desktop.Activate." + hex.EncodeToString(sum[:12])
+}
