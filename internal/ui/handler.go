@@ -2,7 +2,10 @@ package ui
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"html/template"
 	"net/http"
@@ -21,21 +24,45 @@ type EndpointAdmitter interface {
 type page struct {
 	State *State
 	Error string
+	Token string
 }
 
 // NewHandler serves Matagi's local HTML surface. It talks to the runtime only
 // through Client and delegates endpoint navigation admission to the desktop
 // shell after a successful ensure response.
 func NewHandler(client *Client, admitter EndpointAdmitter) http.Handler {
-	return &handler{client: client, admitter: admitter}
+	return &handler{client: client, admitter: admitter, token: newFormToken()}
 }
 
 type handler struct {
 	client   *Client
 	admitter EndpointAdmitter
+	token    string
+}
+
+func newFormToken() string {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(value)
+}
+
+func (h *handler) validFormToken(value string) bool {
+	return len(value) == len(h.token) && subtle.ConstantTimeCompare([]byte(value), []byte(h.token)) == 1
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		if err := parseForm(w, r); err != nil {
+			http.Error(w, "invalid form submission", http.StatusBadRequest)
+			return
+		}
+		if !h.validFormToken(r.PostForm.Get("token")) {
+			http.Error(w, "invalid form token", http.StatusForbidden)
+			return
+		}
+	}
 	switch r.URL.Path {
 	case "/":
 		if r.Method != http.MethodGet {
@@ -48,7 +75,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, http.MethodPost)
 			return
 		}
-		if err := parseForm(w, r); err != nil || r.PostForm.Get("environmentId") == "" {
+		if r.PostForm.Get("environmentId") == "" {
 			http.Error(w, "invalid environment", http.StatusBadRequest)
 			return
 		}
@@ -109,14 +136,10 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request, message string) 
 			}
 		}
 	}
-	h.render(w, page{State: &state, Error: message})
+	h.render(w, page{State: &state, Error: message, Token: h.token})
 }
 
 func (h *handler) register(w http.ResponseWriter, r *http.Request) {
-	if err := parseForm(w, r); err != nil {
-		http.Error(w, "invalid environment", 400)
-		return
-	}
 	request := ConnectRequest{ID: strings.TrimSpace(r.PostForm.Get("name")), SSHHost: strings.TrimSpace(r.PostForm.Get("host"))}
 	if cmd := strings.TrimSpace(r.PostForm.Get("bootstrap")); cmd != "" {
 		request.Bootstrap = strings.Fields(cmd)
@@ -129,10 +152,6 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) addService(w http.ResponseWriter, r *http.Request) {
-	if err := parseForm(w, r); err != nil {
-		http.Error(w, "invalid service", 400)
-		return
-	}
 	port, err := strconv.Atoi(r.PostForm.Get("port"))
 	if err != nil {
 		h.index(w, r, "Enter a valid UI port (1–65535).")
@@ -172,10 +191,6 @@ func describeFailure(err error) string {
 }
 
 func (h *handler) action(w http.ResponseWriter, r *http.Request) {
-	if err := parseForm(w, r); err != nil {
-		http.Error(w, "invalid action request", http.StatusBadRequest)
-		return
-	}
 	envID, serviceID, action := r.PostForm.Get("environmentId"), r.PostForm.Get("serviceId"), r.PostForm.Get("action")
 	if envID == "" || serviceID == "" {
 		http.Error(w, "environment and service are required", http.StatusBadRequest)
@@ -202,10 +217,6 @@ func (h *handler) action(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) open(w http.ResponseWriter, r *http.Request) {
-	if err := parseForm(w, r); err != nil {
-		http.Error(w, "invalid endpoint request", http.StatusBadRequest)
-		return
-	}
 	request := EndpointRequest{
 		EnvironmentID: r.PostForm.Get("environmentId"),
 		ServiceID:     r.PostForm.Get("serviceId"),
@@ -247,8 +258,7 @@ func (h *handler) open(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) showError(w http.ResponseWriter, status int, message string) {
-	w.WriteHeader(status)
-	h.render(w, page{Error: bounded(message, maxErrorMessage)})
+	h.renderStatus(w, status, page{Error: bounded(message, maxErrorMessage), Token: h.token})
 }
 
 func apiStatus(err error) int {
@@ -279,10 +289,15 @@ func methodNotAllowed(w http.ResponseWriter, allowed string) {
 }
 
 func (h *handler) render(w http.ResponseWriter, data page) {
+	h.renderStatus(w, http.StatusOK, data)
+}
+
+func (h *handler) renderStatus(w http.ResponseWriter, status int, data page) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
 	if err := pageTemplate.Execute(w, data); err != nil {
 		return
 	}
