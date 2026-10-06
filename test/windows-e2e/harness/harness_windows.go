@@ -66,19 +66,14 @@ func StartConfigured(t *testing.T, options Options) (apiURL, uiURL string) {
 	// a false product failure.
 	t.Setenv("APPDATA", stateHome)
 	t.Setenv("LOCALAPPDATA", profileHome)
-	store, err := config.NewUserStore()
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot := options.Snapshot
-	if snapshot == nil {
-		snapshot, err = registry.NewSnapshot(nil, nil)
+	if options.Snapshot != nil {
+		store, err := config.NewUserStore()
 		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := store.Save(snapshot); err != nil {
-		t.Fatal(err)
+		if err := store.Save(options.Snapshot); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	cmd := exec.Command(filepath.Join(dir, identity.File))

@@ -3,12 +3,15 @@ package runtime
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/yohn-jp/matagi/internal/config"
 	"github.com/yohn-jp/matagi/internal/registry"
 	"github.com/yohn-jp/matagi/internal/ssh"
 	"github.com/yohn-jp/matagi/internal/tunnel"
@@ -104,4 +107,28 @@ func TestStateDeterministic(t *testing.T) {
 		t.Fatal("unknown service accepted")
 	}
 	_ = r.Close(context.Background())
+}
+
+func TestLoadSnapshotTreatsOnlyMissingRegistryAsEmpty(t *testing.T) {
+	store, err := config.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := loadSnapshot(store)
+	if err != nil {
+		t.Fatalf("missing registry should be empty: %v", err)
+	}
+	if len(snapshot.Environments()) != 0 || len(snapshot.Services()) != 0 {
+		t.Fatalf("missing registry was not empty: %#v", snapshot)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(store.Path()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.Path(), []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSnapshot(store); err == nil {
+		t.Fatal("malformed existing registry was silently treated as empty")
+	}
 }

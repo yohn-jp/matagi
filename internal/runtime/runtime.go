@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -62,7 +63,7 @@ type Runtime struct {
 
 func key(env, service string) string { return env + "\x00" + service }
 func New(store *config.Store) (*Runtime, error) {
-	snapshot, err := store.Load()
+	snapshot, err := loadSnapshot(store)
 	if err != nil {
 		return nil, err
 	}
@@ -79,6 +80,17 @@ func New(store *config.Store) (*Runtime, error) {
 		return nil, err
 	}
 	return Compose(snapshot, client, manager)
+}
+
+func loadSnapshot(store *config.Store) (*registry.Snapshot, error) {
+	snapshot, err := store.Load()
+	if err == nil {
+		return snapshot, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return registry.NewSnapshot(nil, nil)
 }
 
 // Compose accepts validated producer state and external execution seams.
