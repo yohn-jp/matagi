@@ -14,7 +14,7 @@ Matagi is pre-implementation. Issue #1 establishes the initial architecture and 
 
 ## Development
 
-Read [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md) before making changes.
+Read [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md) before making changes. The hosted Windows candidate evidence boundary is described in [docs/windows-certification.md](docs/windows-certification.md); real-host certification is separately owned by #19.
 
 ## Security
 
