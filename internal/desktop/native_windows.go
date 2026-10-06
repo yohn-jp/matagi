@@ -19,32 +19,32 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-var (
-	user32               = windows.NewLazySystemDLL("user32.dll")
-	procRegisterClassExW = user32.NewProc("RegisterClassExW")
-	procUnregisterClassW = user32.NewProc("UnregisterClassW")
-	procCreateWindowExW  = user32.NewProc("CreateWindowExW")
-	procDefWindowProcW   = user32.NewProc("DefWindowProcW")
-	procDestroyWindow    = user32.NewProc("DestroyWindow")
-	procShowWindow       = user32.NewProc("ShowWindow")
-	procUpdateWindow     = user32.NewProc("UpdateWindow")
-	procGetMessageW      = user32.NewProc("GetMessageW")
-	procTranslateMessage = user32.NewProc("TranslateMessage")
-	procDispatchMessageW = user32.NewProc("DispatchMessageW")
-	procPostMessageW              = user32.NewProc("PostMessageW")
-	procPostQuitMessage           = user32.NewProc("PostQuitMessage")
-	procFindWindowW               = user32.NewProc("FindWindowW")
-	procSetForegroundW            = user32.NewProc("SetForegroundWindow")
-	procRegisterWindowMessageW    = user32.NewProc("RegisterWindowMessageW")
-	procAllowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
-	procLoadCursorW               = user32.NewProc("LoadCursorW")
-	procMessageBoxW               = user32.NewProc("MessageBoxW")
-	activeShellMu        sync.Mutex
-	activeShell          *shell
-	wndProcOnce          sync.Once
-	wndProcCallback      uintptr
-)
+var user32 = windows.NewLazySystemDLL("user32.dll")
+var procRegisterClassExW = user32.NewProc("RegisterClassExW")
+var procUnregisterClassW = user32.NewProc("UnregisterClassW")
+var procCreateWindowExW = user32.NewProc("CreateWindowExW")
+var procDefWindowProcW = user32.NewProc("DefWindowProcW")
+var procDestroyWindow = user32.NewProc("DestroyWindow")
+var procShowWindow = user32.NewProc("ShowWindow")
+var procUpdateWindow = user32.NewProc("UpdateWindow")
+var procGetMessageW = user32.NewProc("GetMessageW")
+var procTranslateMessage = user32.NewProc("TranslateMessage")
+var procDispatchMessageW = user32.NewProc("DispatchMessageW")
+var procPostMessageW = user32.NewProc("PostMessageW")
+var procPostQuitMessage = user32.NewProc("PostQuitMessage")
+var procFindWindowW = user32.NewProc("FindWindowW")
+var procSetForegroundW = user32.NewProc("SetForegroundWindow")
+var procRegisterWindowMessageW = user32.NewProc("RegisterWindowMessageW")
+var procAllowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
+var procLoadCursorW = user32.NewProc("LoadCursorW")
+var procMessageBoxW = user32.NewProc("MessageBoxW")
 
+var (
+	activeShellMu   sync.Mutex
+	activeShell     *shell
+	wndProcOnce     sync.Once
+	wndProcCallback uintptr
+)
 const (
 	wsOverlappedWindow = 0x00CF0000
 	cwUseDefault       = 0x80000000
