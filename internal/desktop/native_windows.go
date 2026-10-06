@@ -9,9 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"time"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/wailsapp/go-webview2/pkg/edge"
@@ -31,14 +31,14 @@ var (
 	procGetMessageW      = user32.NewProc("GetMessageW")
 	procTranslateMessage = user32.NewProc("TranslateMessage")
 	procDispatchMessageW = user32.NewProc("DispatchMessageW")
-	procPostMessageW     = user32.NewProc("PostMessageW")
-	procPostQuitMessage  = user32.NewProc("PostQuitMessage")
-	procFindWindowW             = user32.NewProc("FindWindowW")
-	procSetForegroundW          = user32.NewProc("SetForegroundWindow")
-	procRegisterWindowMessageW  = user32.NewProc("RegisterWindowMessageW")
+	procPostMessageW              = user32.NewProc("PostMessageW")
+	procPostQuitMessage           = user32.NewProc("PostQuitMessage")
+	procFindWindowW               = user32.NewProc("FindWindowW")
+	procSetForegroundW            = user32.NewProc("SetForegroundWindow")
+	procRegisterWindowMessageW    = user32.NewProc("RegisterWindowMessageW")
 	procAllowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
-	procLoadCursorW      = user32.NewProc("LoadCursorW")
-	procMessageBoxW      = user32.NewProc("MessageBoxW")
+	procLoadCursorW               = user32.NewProc("LoadCursorW")
+	procMessageBoxW               = user32.NewProc("MessageBoxW")
 	activeShellMu        sync.Mutex
 	activeShell          *shell
 	wndProcOnce          sync.Once
