@@ -28,7 +28,8 @@ func TestCleanProfileOnboardsThroughExactCandidate(t *testing.T) {
 	if !strings.Contains(first, "Connect a development environment") || strings.Contains(first, "<textarea") || strings.Contains(first, "registry JSON") {
 		t.Fatal("rejected first-run surface")
 	}
-	resp, err := http.PostForm(uiURL+"/register", url.Values{"name": {"fixture-env"}, "host": {"fixture-host"}})
+	token := formToken(t, uiURL)
+	resp, err := http.PostForm(uiURL+"/register", url.Values{"token": {token}, "name": {"fixture-env"}, "host": {"fixture-host"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +42,7 @@ func TestCleanProfileOnboardsThroughExactCandidate(t *testing.T) {
 		t.Fatal("workspace did not replace onboarding")
 	}
 	port := startRemoteHTTP(t)
-	resp, err = http.PostForm(uiURL+"/service/add", url.Values{"environmentId": {"fixture-env"}, "service": {"yokodori"}, "command": {"fixture-service"}, "cwd": {"/fixture"}, "port": {strconv.Itoa(port)}})
+	resp, err = http.PostForm(uiURL+"/service/add", url.Values{"token": {token}, "environmentId": {"fixture-env"}, "service": {"yokodori"}, "command": {"fixture-service"}, "cwd": {"/fixture"}, "port": {strconv.Itoa(port)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +51,7 @@ func TestCleanProfileOnboardsThroughExactCandidate(t *testing.T) {
 		t.Fatalf("service registration failed: %d", resp.StatusCode)
 	}
 	postActionService(t, uiURL, "yokodori", "start")
-	resp, err = http.PostForm(uiURL+"/open", url.Values{"environmentId": {"fixture-env"}, "serviceId": {"yokodori"}, "endpointId": {"ui"}})
+	resp, err = http.PostForm(uiURL+"/open", url.Values{"token": {token}, "environmentId": {"fixture-env"}, "serviceId": {"yokodori"}, "endpointId": {"ui"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +63,7 @@ func TestCleanProfileOnboardsThroughExactCandidate(t *testing.T) {
 
 func postActionService(t *testing.T, base, id, action string) {
 	t.Helper()
-	resp, err := http.PostForm(base+"/action", url.Values{"environmentId": {"fixture-env"}, "serviceId": {id}, "action": {action}})
+	resp, err := http.PostForm(base+"/action", url.Values{"token": {formToken(t, base)}, "environmentId": {"fixture-env"}, "serviceId": {id}, "action": {action}})
 	if err != nil {
 		t.Fatal(err)
 	}
