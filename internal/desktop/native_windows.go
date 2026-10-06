@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -32,6 +33,8 @@ var (
 	procDispatchMessageW = user32.NewProc("DispatchMessageW")
 	procPostMessageW     = user32.NewProc("PostMessageW")
 	procPostQuitMessage  = user32.NewProc("PostQuitMessage")
+	procFindWindowW      = user32.NewProc("FindWindowW")
+	procSetForegroundW   = user32.NewProc("SetForegroundWindow")
 	procLoadCursorW      = user32.NewProc("LoadCursorW")
 	procMessageBoxW      = user32.NewProc("MessageBoxW")
 	activeShellMu        sync.Mutex
@@ -43,6 +46,7 @@ var (
 const (
 	wsOverlappedWindow = 0x00CF0000
 	cwUseDefault       = 0x80000000
+	swHide             = 0
 	swShowNormal       = 1
 	idcArrow           = 32512
 	colorWindow        = 5
@@ -92,6 +96,62 @@ type native struct{}
 
 func Native() Platform { return native{} }
 
+func (native) RuntimeVersion() (string, error) {
+	return webviewloader.GetAvailableCoreWebView2BrowserVersionString("")
+}
+
+func currentUserID() (string, error) {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return "", fmt.Errorf("resolving current user: %w", err)
+	}
+	return user.User.Sid.String(), nil
+}
+
+func (native) AcquireInstance() (func(), error) {
+	userID, err := currentUserID()
+	if err != nil {
+		return nil, err
+	}
+	name, err := windows.UTF16PtrFromString(InstanceName(userID))
+	if err != nil {
+		return nil, err
+	}
+	handle, err := windows.CreateMutex(nil, false, name)
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		if handle != 0 {
+			_ = windows.CloseHandle(handle)
+		}
+		return nil, ErrAlreadyRunning
+	}
+	if err != nil {
+		return nil, fmt.Errorf("creating desktop single-instance guard: %w", err)
+	}
+	return func() { _ = windows.CloseHandle(handle) }, nil
+}
+
+func (native) Activate() error {
+	class, err := windows.UTF16PtrFromString(windowClass)
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(class)), 0)
+		if hwnd != 0 {
+			procShowWindow.Call(hwnd, swShowNormal)
+			if ok, _, callErr := procSetForegroundW.Call(hwnd); ok == 0 {
+				return fmt.Errorf("activating existing Matagi window: %w", callErr)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("running Matagi desktop has no window to activate")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func (native) ReportError(title, message string) {
 	t, _ := windows.UTF16PtrFromString(title)
 	m, _ := windows.UTF16PtrFromString(message)
@@ -106,12 +166,12 @@ func (native) Open(ctx context.Context, w Window) error {
 	if ctx == nil {
 		return errors.New("desktop context is required")
 	}
-	version, err := webviewloader.GetAvailableCoreWebView2BrowserVersionString("")
+	version, err := (native{}).RuntimeVersion()
 	if err != nil {
 		return fmt.Errorf("detecting the WebView2 Runtime: %w", err)
 	}
 	if version == "" {
-		return errors.New("Microsoft Edge WebView2 Runtime is not installed")
+		return ErrWebView2Missing
 	}
 	dataDir := w.DataDir
 	if dataDir == "" {
