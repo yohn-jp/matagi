@@ -90,7 +90,7 @@ func (f *registeringFake) Register(s *registry.Snapshot) error {
 }
 func TestRegistrationValidatesBeforeMutation(t *testing.T) {
 	f := &registeringFake{}
-	for _, body := range []string{`{}`, `{"environments":[{"id":"dev","sshHost":"host"}]}`, `{"environments":[],"services":[]}`} {
+	for _, body := range []string{`{}`, `{"environments":[{"id":"dev","sshHost":"-unsafe"}]}`, `{"environments":[],"services":[]}`} {
 		w := httptest.NewRecorder()
 		New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/environment/register", strings.NewReader(body)))
 		if w.Code != 400 || f.registrations != 0 {

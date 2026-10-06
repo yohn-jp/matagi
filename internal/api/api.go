@@ -59,6 +59,70 @@ func failure(w http.ResponseWriter, status int, code string) {
 	}{code, code}})
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/environment/connect" && r.Method == http.MethodPost {
+		owner, ok := h.runtime.(interface {
+			Connect(context.Context, string, string, []string) error
+		})
+		if !ok {
+			failure(w, 409, "registration-unavailable")
+			return
+		}
+		var input struct {
+			ID        string   `json:"id"`
+			SSHHost   string   `json:"sshHost"`
+			Bootstrap []string `json:"bootstrap"`
+		}
+		if !decodeRequest(r, &input) {
+			failure(w, 400, "invalid-request")
+			return
+		}
+		if _, err := registry.NewSnapshot([]registry.Environment{{ID: registry.EnvironmentID(input.ID), SSHHost: input.SSHHost, Jinushi: registry.JinushiDefinition{SupervisorStartCommand: input.Bootstrap}}}, nil); err != nil {
+			failure(w, 400, "invalid-request")
+			return
+		}
+		if err := owner.Connect(r.Context(), input.ID, input.SSHHost, input.Bootstrap); err != nil {
+			operationFailure(w, err)
+			return
+		}
+		write(w, 200, h.runtime.Snapshot())
+		return
+	}
+	if r.URL.Path == "/v1/service/add" && r.Method == http.MethodPost {
+		owner, ok := h.runtime.(interface{ AddService(registry.Service) error })
+		if !ok {
+			failure(w, 409, "registration-unavailable")
+			return
+		}
+		var input struct {
+			EnvironmentID string   `json:"environmentId"`
+			ID            string   `json:"id"`
+			Argv          []string `json:"argv"`
+			CWD           string   `json:"cwd"`
+			Port          int      `json:"port"`
+			HealthPath    string   `json:"healthPath"`
+		}
+		if !decodeRequest(r, &input) {
+			failure(w, 400, "invalid-request")
+			return
+		}
+		if input.HealthPath == "" {
+			input.HealthPath = "/"
+		}
+		service := registry.Service{ID: registry.ServiceID(input.ID), EnvironmentID: registry.EnvironmentID(input.EnvironmentID), DesiredState: registry.DesiredStopped,
+			Execution: registry.ExecutionIntent{Argv: input.Argv, CWD: input.CWD, Lifetime: registry.LifetimeDetached},
+			Endpoints: []registry.Endpoint{{ID: "ui", Label: "User interface", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: input.Port}},
+			Health:    registry.HealthDefinition{Type: registry.HealthHTTP, EndpointID: "ui", Path: input.HealthPath}}
+		if _, err := registry.NewSnapshot([]registry.Environment{{ID: registry.EnvironmentID(input.EnvironmentID), SSHHost: "validation"}}, []registry.Service{service}); err != nil {
+			failure(w, 400, "invalid-request")
+			return
+		}
+		if err := owner.AddService(service); err != nil {
+			operationFailure(w, err)
+			return
+		}
+		write(w, 200, h.runtime.Snapshot())
+		return
+	}
 	if r.URL.Path == "/v1/environment/ensure-jinushi" && r.Method == http.MethodPost {
 		owner, ok := h.runtime.(interface {
 			EnsureJinushi(context.Context, string) error
@@ -186,6 +250,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}{1, result})
 	}
 }
+func decodeRequest(r *http.Request, dst any) bool {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 65537))
+	decoder.DisallowUnknownFields()
+	var trailing any
+	return decoder.Decode(dst) == nil && decoder.Decode(&trailing) == io.EOF
+}
+
+func operationFailure(w http.ResponseWriter, err error) {
+	var f *runtime.Failure
+	if errors.As(err, &f) {
+		status := 502
+		if f.Code == "invalid-request" {
+			status = 400
+		}
+		if f.Code == "lifecycle-conflict" {
+			status = 409
+		}
+		failure(w, status, f.Code)
+		return
+	}
+	failure(w, 500, "registration-failed")
+}
+
 func Listen() (net.Listener, error) { return net.Listen("tcp4", "127.0.0.1:0") }
 func Serve(ctx context.Context, rt Runtime) error {
 	listener, err := Listen()

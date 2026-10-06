@@ -119,7 +119,7 @@ func runDesktop(parent context.Context, rt lifecycle, platform desktop.Platform)
 		return closeRuntime(rt, fmt.Errorf("binding UI: %w", err))
 	}
 	defer uiListener.Close()
-	client, err := ui.NewClient("http://"+apiListener.Addr().String(), 5*time.Second)
+	client, err := ui.NewClient("http://"+apiListener.Addr().String(), 30*time.Second)
 	if err != nil {
 		return closeRuntime(rt, err)
 	}

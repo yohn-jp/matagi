@@ -479,6 +479,7 @@ type State struct {
 }
 type Environment struct {
 	ID           string                   `json:"id"`
+	SSHHost      string                   `json:"sshHost"`
 	Connectivity health.ConnectivityState `json:"connectivity"`
 	Jinushi      string                   `json:"jinushi"`
 	Error        string                   `json:"error"`
@@ -561,7 +562,7 @@ func (r *Runtime) Snapshot() State {
 	observed := r.observer.Snapshot()
 	result := State{Version: 1, Environments: []Environment{}}
 	for _, e := range r.registry.Environments() {
-		view := Environment{ID: string(e.ID), Connectivity: health.ConnectivityUnknown, Jinushi: "unknown", Services: []Service{}}
+		view := Environment{ID: string(e.ID), SSHHost: e.SSHHost, Connectivity: health.ConnectivityUnknown, Jinushi: "unknown", Services: []Service{}}
 		if status := r.jinushi[view.ID]; status != "" {
 			view.Jinushi = status
 		}

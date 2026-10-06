@@ -240,9 +240,6 @@ func validateJinushiDefinition(environmentID EnvironmentID, definition JinushiDe
 	if strings.ContainsRune(definition.StateDir, '\x00') {
 		return fmt.Errorf("environment %q Jinushi state directory cannot contain NUL", environmentID)
 	}
-	if len(definition.SupervisorStartCommand) == 0 {
-		return fmt.Errorf("environment %q Jinushi supervisor start command must not be empty", environmentID)
-	}
 	for i, arg := range definition.SupervisorStartCommand {
 		if arg == "" || (i == 0 && strings.TrimSpace(arg) == "") || strings.ContainsRune(arg, '\x00') {
 			return fmt.Errorf("environment %q Jinushi supervisor start command argv[%d] is invalid", environmentID, i)

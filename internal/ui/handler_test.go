@@ -29,8 +29,8 @@ func TestHandlerRendersContractStateWithoutUnknownRuntimeData(t *testing.T) {
 	}
 	body := response.Body.String()
 	for _, want := range []string{
-		"Environment dev", "Connectivity: connected", "environment error", "Desired", "running",
-		"process warning", "readiness warning", "Dashboard", "Endpoint: available", "Tunnel: ready", "Local: available",
+		"dev", "Connection · SSH", "environment error", "Jinushi · supervisor", "running", "tone-ok", "prefers-color-scheme: light", "aria-busy", "Start", "Restart", "Stop",
+		"process warning", "readiness warning", "Dashboard", "available", "Tunnel: ready", "Open",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page lacks %q", want)
@@ -53,7 +53,7 @@ func TestEmptyStateRegistrationSurfaceAndSubmission(t *testing.T) {
 			fmt.Fprint(w, `{"version":1,"environments":[]}`)
 			return
 		}
-		if r.URL.Path != "/v1/environment/register" {
+		if r.URL.Path != "/v1/environment/connect" {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 		requests++
@@ -64,16 +64,11 @@ func TestEmptyStateRegistrationSurfaceAndSubmission(t *testing.T) {
 	h := NewHandler(client, nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
-	if !strings.Contains(w.Body.String(), "Add development environment") {
-		t.Fatal(w.Body.String())
+	if !strings.Contains(w.Body.String(), "Connect a development environment") || strings.Contains(w.Body.String(), "registry JSON") || strings.Contains(w.Body.String(), "<textarea") {
+		t.Fatal("onboarding surface exposes registry schema")
 	}
 	w = httptest.NewRecorder()
-	h.ServeHTTP(w, formRequest("POST", "/register", url.Values{"configuration": {`{broken`}}))
-	if requests != 0 || w.Code != 400 {
-		t.Fatal(w.Code, requests)
-	}
-	w = httptest.NewRecorder()
-	h.ServeHTTP(w, formRequest("POST", "/register", url.Values{"configuration": {`{"environments":[],"services":[]}`}}))
+	h.ServeHTTP(w, formRequest("POST", "/register", url.Values{"name": {"dev"}, "host": {"dev-host"}}))
 	if requests != 1 || w.Code != 303 {
 		t.Fatal(w.Code, requests)
 	}
