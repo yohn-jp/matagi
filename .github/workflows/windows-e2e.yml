@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [startup, surface, transport, lifecycle]
+        shard: [startup, surface, transport, lifecycle, single-instance]
     env:
       MATAGI_E2E_CANDIDATE: ${{ github.workspace }}\candidate
       MATAGI_E2E_SOURCE: ${{ github.sha }}

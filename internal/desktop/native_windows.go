@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/wailsapp/go-webview2/pkg/edge"
@@ -18,31 +19,37 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+var user32 = windows.NewLazySystemDLL("user32.dll")
+var procRegisterClassExW = user32.NewProc("RegisterClassExW")
+var procUnregisterClassW = user32.NewProc("UnregisterClassW")
+var procCreateWindowExW = user32.NewProc("CreateWindowExW")
+var procDefWindowProcW = user32.NewProc("DefWindowProcW")
+var procDestroyWindow = user32.NewProc("DestroyWindow")
+var procShowWindow = user32.NewProc("ShowWindow")
+var procUpdateWindow = user32.NewProc("UpdateWindow")
+var procGetMessageW = user32.NewProc("GetMessageW")
+var procTranslateMessage = user32.NewProc("TranslateMessage")
+var procDispatchMessageW = user32.NewProc("DispatchMessageW")
+var procPostMessageW = user32.NewProc("PostMessageW")
+var procPostQuitMessage = user32.NewProc("PostQuitMessage")
+var procFindWindowW = user32.NewProc("FindWindowW")
+var procSetForegroundW = user32.NewProc("SetForegroundWindow")
+var procRegisterWindowMessageW = user32.NewProc("RegisterWindowMessageW")
+var procAllowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
+var procLoadCursorW = user32.NewProc("LoadCursorW")
+var procMessageBoxW = user32.NewProc("MessageBoxW")
+
 var (
-	user32               = windows.NewLazySystemDLL("user32.dll")
-	procRegisterClassExW = user32.NewProc("RegisterClassExW")
-	procUnregisterClassW = user32.NewProc("UnregisterClassW")
-	procCreateWindowExW  = user32.NewProc("CreateWindowExW")
-	procDefWindowProcW   = user32.NewProc("DefWindowProcW")
-	procDestroyWindow    = user32.NewProc("DestroyWindow")
-	procShowWindow       = user32.NewProc("ShowWindow")
-	procUpdateWindow     = user32.NewProc("UpdateWindow")
-	procGetMessageW      = user32.NewProc("GetMessageW")
-	procTranslateMessage = user32.NewProc("TranslateMessage")
-	procDispatchMessageW = user32.NewProc("DispatchMessageW")
-	procPostMessageW     = user32.NewProc("PostMessageW")
-	procPostQuitMessage  = user32.NewProc("PostQuitMessage")
-	procLoadCursorW      = user32.NewProc("LoadCursorW")
-	procMessageBoxW      = user32.NewProc("MessageBoxW")
-	activeShellMu        sync.Mutex
-	activeShell          *shell
-	wndProcOnce          sync.Once
-	wndProcCallback      uintptr
+	activeShellMu   sync.Mutex
+	activeShell     *shell
+	wndProcOnce     sync.Once
+	wndProcCallback uintptr
 )
 
 const (
 	wsOverlappedWindow = 0x00CF0000
 	cwUseDefault       = 0x80000000
+	swHide             = 0
 	swShowNormal       = 1
 	idcArrow           = 32512
 	colorWindow        = 5
@@ -86,11 +93,80 @@ type shell struct {
 	initializing bool
 	quitPending  bool
 	closed       bool
+	activateMsg  uint32
 }
 
 type native struct{}
 
 func Native() Platform { return native{} }
+
+func (native) RuntimeVersion() (string, error) {
+	return webviewloader.GetAvailableCoreWebView2BrowserVersionString("")
+}
+
+func currentUserID() (string, error) {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return "", fmt.Errorf("resolving current user: %w", err)
+	}
+	return user.User.Sid.String(), nil
+}
+
+func (native) AcquireInstance() (func(), error) {
+	userID, err := currentUserID()
+	if err != nil {
+		return nil, err
+	}
+	name, err := windows.UTF16PtrFromString(InstanceName(userID))
+	if err != nil {
+		return nil, err
+	}
+	handle, err := windows.CreateMutex(nil, false, name)
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		if handle != 0 {
+			_ = windows.CloseHandle(handle)
+		}
+		return nil, ErrAlreadyRunning
+	}
+	if err != nil {
+		return nil, fmt.Errorf("creating desktop single-instance guard: %w", err)
+	}
+	return func() { _ = windows.CloseHandle(handle) }, nil
+}
+
+func (native) Activate() error {
+	userID, err := currentUserID()
+	if err != nil {
+		return err
+	}
+	class, err := windows.UTF16PtrFromString(windowClass)
+	if err != nil {
+		return err
+	}
+	messageName, err := windows.UTF16PtrFromString(ActivateMessageName(userID))
+	if err != nil {
+		return err
+	}
+	message, _, callErr := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(messageName)))
+	if message == 0 {
+		return fmt.Errorf("registering desktop activation message: %w", callErr)
+	}
+	procAllowSetForegroundWindow.Call(^uintptr(0))
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(class)), 0)
+		if hwnd != 0 {
+			if ok, _, err := procPostMessageW.Call(hwnd, message, 0, 0); ok == 0 {
+				return fmt.Errorf("posting desktop activation message: %w", err)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("running Matagi desktop has no window to activate")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
 
 func (native) ReportError(title, message string) {
 	t, _ := windows.UTF16PtrFromString(title)
@@ -106,12 +182,12 @@ func (native) Open(ctx context.Context, w Window) error {
 	if ctx == nil {
 		return errors.New("desktop context is required")
 	}
-	version, err := webviewloader.GetAvailableCoreWebView2BrowserVersionString("")
+	version, err := (native{}).RuntimeVersion()
 	if err != nil {
 		return fmt.Errorf("detecting the WebView2 Runtime: %w", err)
 	}
 	if version == "" {
-		return errors.New("Microsoft Edge WebView2 Runtime is not installed")
+		return ErrWebView2Missing
 	}
 	dataDir := w.DataDir
 	if dataDir == "" {
@@ -135,6 +211,19 @@ func (native) Open(ctx context.Context, w Window) error {
 	}
 
 	s := &shell{}
+	userID, err := currentUserID()
+	if err != nil {
+		return err
+	}
+	messageName, err := windows.UTF16PtrFromString(ActivateMessageName(userID))
+	if err != nil {
+		return err
+	}
+	activateMessageID, _, callErr := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(messageName)))
+	if activateMessageID == 0 {
+		return fmt.Errorf("registering desktop activation message: %w", callErr)
+	}
+	s.activateMsg = uint32(activateMessageID)
 	activeShellMu.Lock()
 	if activeShell != nil {
 		activeShellMu.Unlock()
@@ -297,6 +386,15 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 		case wmDestroy:
 			s.hwnd = 0
 			procPostQuitMessage.Call(0)
+			return 0
+		}
+		if s.activateMsg != 0 && uint32(message) == s.activateMsg {
+			procShowWindow.Call(hwnd, swShowNormal)
+			procSetForegroundW.Call(hwnd)
+			if s.chromium != nil {
+				s.chromium.Resize()
+				s.chromium.Focus()
+			}
 			return 0
 		}
 	}

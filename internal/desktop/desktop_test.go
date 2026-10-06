@@ -87,6 +87,10 @@ type fakePlatform struct {
 	err    error
 }
 
+func (*fakePlatform) RuntimeVersion() (string, error)  { return "test", nil }
+func (*fakePlatform) AcquireInstance() (func(), error) { return func() {}, nil }
+func (*fakePlatform) Activate() error                  { return nil }
+
 func (p *fakePlatform) Open(_ context.Context, w Window) error {
 	p.opened++
 	p.window = w
@@ -166,5 +170,53 @@ func TestEnsureResponseIsTheOnlySourceOfAdmittedEndpointNavigation(t *testing.T)
 	}
 	if policy.AllowNavigation("http://127.0.0.1:43124/") {
 		t.Fatal("ensure admitted an unrelated loopback origin")
+	}
+}
+
+func TestPreflightChecksRuntimeBeforeInstance(t *testing.T) {
+	p := &preflightPlatform{}
+	_, release, err := Preflight(p)
+	if !errors.Is(err, ErrWebView2Missing) || release != nil || p.acquired {
+		t.Fatalf("missing runtime: release=%v err=%v acquired=%v", release != nil, err, p.acquired)
+	}
+
+	p.version = "1.0"
+	version, release, err := Preflight(p)
+	if err != nil || version != "1.0" || release == nil || !p.acquired {
+		t.Fatalf("preflight: version=%q release=%v err=%v acquired=%v", version, release != nil, err, p.acquired)
+	}
+	release()
+}
+
+type preflightPlatform struct {
+	version  string
+	acquired bool
+}
+
+func (p *preflightPlatform) RuntimeVersion() (string, error) { return p.version, nil }
+func (p *preflightPlatform) AcquireInstance() (func(), error) {
+	p.acquired = true
+	return func() {}, nil
+}
+func (*preflightPlatform) Activate() error                    { return nil }
+func (*preflightPlatform) Open(context.Context, Window) error { return nil }
+func (*preflightPlatform) ReportError(string, string)         {}
+
+func TestInstanceNameIsBoundedAndUserSpecific(t *testing.T) {
+	a := InstanceName("S-1-5-21-a")
+	b := InstanceName("S-1-5-21-b")
+	if a == b || !strings.HasPrefix(a, instancePrefix) || strings.Contains(a, "S-1-5-21-a") {
+		t.Fatalf("instance names not opaque/user-specific: %q %q", a, b)
+	}
+}
+
+func TestOwnedConsolePolicy(t *testing.T) {
+	if !shouldHideOwnedConsole(10, []uint32{10}) {
+		t.Fatal("sole owned console should be hidden")
+	}
+	for _, attached := range [][]uint32{nil, {10, 20}, {20}} {
+		if shouldHideOwnedConsole(10, attached) {
+			t.Fatalf("shared/unowned console would be hidden: %v", attached)
+		}
 	}
 }

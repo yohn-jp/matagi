@@ -215,6 +215,35 @@ func listeningPorts(pid int) ([]int, error) {
 	return ports, nil
 }
 
+func LaunchDuplicate(t *testing.T) {
+	t.Helper()
+	dir := os.Getenv("MATAGI_E2E_CANDIDATE")
+	source := os.Getenv("MATAGI_E2E_SOURCE")
+	sum := os.Getenv("MATAGI_E2E_SHA256")
+	if _, err := identity.Verify(dir, source, sum); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(filepath.Join(dir, identity.File))
+	cmd.Env = os.Environ()
+	out := new(strings.Builder)
+	cmd.Stderr = out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("duplicate candidate exit: %v (stderr: %s)", err, out.String())
+		}
+	case <-time.After(12 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatalf("duplicate candidate did not activate existing instance and exit (stderr: %s)", out.String())
+	}
+}
+
 func Get(t *testing.T, url string) string {
 	t.Helper()
 	resp, err := (&http.Client{Timeout: 3 * time.Second}).Get(url)

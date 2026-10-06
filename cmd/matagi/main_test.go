@@ -46,6 +46,9 @@ type fakePlatform struct {
 	open func(context.Context, desktop.Window) error
 }
 
+func (fakePlatform) RuntimeVersion() (string, error)                    { return "test", nil }
+func (fakePlatform) AcquireInstance() (func(), error)                   { return func() {}, nil }
+func (fakePlatform) Activate() error                                    { return nil }
 func (p fakePlatform) Open(ctx context.Context, w desktop.Window) error { return p.open(ctx, w) }
 func (fakePlatform) ReportError(string, string)                         {}
 

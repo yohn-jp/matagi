@@ -9,6 +9,10 @@ import (
 
 var ErrUnsupported = errors.New("the Matagi desktop shell is only available on Windows")
 
+var ErrAlreadyRunning = errors.New("Matagi desktop is already running for this user")
+
+var ErrWebView2Missing = errors.New("the Microsoft Edge WebView2 Runtime is not installed")
+
 type NavigationPolicy interface {
 	AllowNavigation(uri string) bool
 	AllowNewWindow(uri string) bool
@@ -22,8 +26,31 @@ type Window struct {
 }
 
 type Platform interface {
+	RuntimeVersion() (string, error)
+	AcquireInstance() (release func(), err error)
+	Activate() error
 	Open(context.Context, Window) error
 	ReportError(title, message string)
+}
+
+// Preflight performs Windows prerequisites before Matagi composes runtime or
+// tunnel authority.
+func Preflight(p Platform) (version string, release func(), err error) {
+	if p == nil {
+		return "", nil, errors.New("desktop platform is unavailable")
+	}
+	version, err = p.RuntimeVersion()
+	if err != nil {
+		return "", nil, err
+	}
+	if version == "" {
+		return "", nil, ErrWebView2Missing
+	}
+	release, err = p.AcquireInstance()
+	if err != nil {
+		return "", nil, err
+	}
+	return version, release, nil
 }
 
 // Open validates the initial URL against the same policy that protects later
