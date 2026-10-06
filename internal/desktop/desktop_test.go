@@ -135,10 +135,14 @@ func TestOpenReturnsPlatformFailure(t *testing.T) {
 func TestEnsureResponseIsTheOnlySourceOfAdmittedEndpointNavigation(t *testing.T) {
 	const endpointURL = "http://127.0.0.1:43123/registered-ui/"
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/endpoint/ensure" {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/state":
+			fmt.Fprint(w, "{\"version\":1,\"environments\":[]}")
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/endpoint/ensure":
+			fmt.Fprintf(w, "{\"version\":1,\"endpoint\":{\"id\":\"dash\",\"label\":\"Dashboard\",\"endpointState\":\"available\",\"tunnelState\":\"ready\",\"localUrl\":%q,\"failure\":\"\"}}", endpointURL)
+		default:
 			t.Errorf("API request = %s %s", r.Method, r.URL.Path)
 		}
-		fmt.Fprintf(w, "{\"version\":1,\"endpoint\":{\"id\":\"dash\",\"label\":\"Dashboard\",\"endpointState\":\"available\",\"tunnelState\":\"ready\",\"localUrl\":%q,\"failure\":\"\"}}", endpointURL)
 	}))
 	defer apiServer.Close()
 	client, err := ui.NewClient(apiServer.URL, time.Second)
@@ -153,7 +157,21 @@ func TestEnsureResponseIsTheOnlySourceOfAdmittedEndpointNavigation(t *testing.T)
 		t.Fatal("endpoint was admitted before ensure")
 	}
 	handler := ui.NewHandler(client, policy)
+	pageResponse := httptest.NewRecorder()
+	handler.ServeHTTP(pageResponse, httptest.NewRequest(http.MethodGet, "/", nil))
+	const tokenMarker = `name="token" value="`
+	pageBody := pageResponse.Body.String()
+	tokenStart := strings.Index(pageBody, tokenMarker)
+	if tokenStart < 0 {
+		t.Fatal("UI did not render a form token")
+	}
+	tokenStart += len(tokenMarker)
+	tokenEnd := strings.IndexByte(pageBody[tokenStart:], '"')
+	if tokenEnd < 0 {
+		t.Fatal("UI rendered a malformed form token")
+	}
 	form := url.Values{
+		"token":         {pageBody[tokenStart : tokenStart+tokenEnd]},
 		"environmentId": {"dev"},
 		"serviceId":     {"svc"},
 		"endpointId":    {"dash"},
