@@ -85,12 +85,12 @@ type winMessage struct {
 }
 
 type shell struct {
-	hwnd         uintptr
-	chromium     *edge.Chromium
-	controller   *edge.ICoreWebView2Controller
-	guard        *navigationGuard
-	closeOnce    sync.Once
-	initializing bool
+	hwnd            uintptr
+	chromium        *edge.Chromium
+	controller      *edge.ICoreWebView2Controller
+	guard           *navigationGuard
+	closeOnce       sync.Once
+	initializing    bool
 	quitPending     bool
 	activatePending bool
 	closed          bool
