@@ -54,9 +54,18 @@ func StartConfigured(t *testing.T, options Options) (apiURL, uiURL string) {
 		t.Fatal(err)
 	}
 
-	home := t.TempDir()
-	t.Setenv("APPDATA", home)
-	t.Setenv("LOCALAPPDATA", home)
+	stateHome := t.TempDir()
+	profileHome, err := os.MkdirTemp("", "matagi-e2e-profile-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// APPDATA owns the isolated Matagi config. LOCALAPPDATA owns the WebView2
+	// profile and deliberately is not a testing.TempDir: Chromium may release
+	// profile handles asynchronously after the candidate process exits, and
+	// testing's immediate RemoveAll would turn that Windows sharing delay into
+	// a false product failure.
+	t.Setenv("APPDATA", stateHome)
+	t.Setenv("LOCALAPPDATA", profileHome)
 	store, err := config.NewUserStore()
 	if err != nil {
 		t.Fatal(err)
