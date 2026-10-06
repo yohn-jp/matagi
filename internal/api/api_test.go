@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yohn-jp/matagi/internal/registry"
 	"github.com/yohn-jp/matagi/internal/runtime"
 )
 
@@ -72,6 +73,40 @@ func TestInvalidRequests(t *testing.T) {
 		if w.Code != 400 || !strings.Contains(w.Body.String(), `"code":"invalid-request"`) {
 			t.Fatal(w.Code, w.Body.String())
 		}
+	}
+}
+
+type registeringFake struct {
+	fake
+	registrations int
+}
+
+func (f *registeringFake) Register(s *registry.Snapshot) error {
+	if len(s.Environments()) != 1 {
+		panic("unvalidated snapshot")
+	}
+	f.registrations++
+	return nil
+}
+func TestRegistrationValidatesBeforeMutation(t *testing.T) {
+	f := &registeringFake{}
+	for _, body := range []string{`{}`, `{"environments":[{"id":"dev","sshHost":"host"}]}`, `{"environments":[],"services":[]}`} {
+		w := httptest.NewRecorder()
+		New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/environment/register", strings.NewReader(body)))
+		if w.Code != 400 || f.registrations != 0 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+	}
+	body := `{"environments":[{"id":"dev","sshHost":"host","jinushi":{"supervisorStartCommand":["start"]}}],"services":[]}`
+	w := httptest.NewRecorder()
+	New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/environment/register", strings.NewReader(body)))
+	if w.Code != 200 || f.registrations != 1 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	New(&fake{}).ServeHTTP(w, httptest.NewRequest("POST", "/v1/environment/register", strings.NewReader(body)))
+	if w.Code != 409 {
+		t.Fatal(w.Code)
 	}
 }
 func TestLoopback(t *testing.T) {

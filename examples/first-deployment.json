@@ -1,0 +1,30 @@
+{
+  "environments": [
+    {
+      "id": "development",
+      "sshHost": "development",
+      "jinushi": {
+        "stateDir": "",
+        "supervisorStartCommand": ["systemctl", "--user", "start", "jinushi"]
+      }
+    }
+  ],
+  "services": [
+    {
+      "id": "inari",
+      "environmentId": "development",
+      "desiredState": "stopped",
+      "execution": {"argv": ["inari", "serve"], "cwd": "/path/to/inari", "lifetime": "detached"},
+      "health": {"type": "http", "endpointId": "ui", "path": "/health"},
+      "endpoints": [{"id": "ui", "label": "Inari UI", "remoteAddress": "127.0.0.1", "remotePort": 8080}]
+    },
+    {
+      "id": "yokodori",
+      "environmentId": "development",
+      "desiredState": "stopped",
+      "execution": {"argv": ["yokodori", "serve"], "cwd": "/path/to/yokodori", "lifetime": "detached"},
+      "health": {"type": "http", "endpointId": "ui", "path": "/health"},
+      "endpoints": [{"id": "ui", "label": "Yokodori UI", "remoteAddress": "127.0.0.1", "remotePort": 8081}]
+    }
+  ]
+}

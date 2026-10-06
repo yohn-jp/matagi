@@ -46,6 +46,39 @@ func TestHandlerRendersContractStateWithoutUnknownRuntimeData(t *testing.T) {
 	}
 }
 
+func TestEmptyStateRegistrationSurfaceAndSubmission(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/state" {
+			fmt.Fprint(w, `{"version":1,"environments":[]}`)
+			return
+		}
+		if r.URL.Path != "/v1/environment/register" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		requests++
+		fmt.Fprint(w, `{"version":1,"environments":[]}`)
+	}))
+	defer server.Close()
+	client, _ := NewClient(server.URL, time.Second)
+	h := NewHandler(client, nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if !strings.Contains(w.Body.String(), "Add development environment") {
+		t.Fatal(w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, formRequest("POST", "/register", url.Values{"configuration": {`{broken`}}))
+	if requests != 0 || w.Code != 400 {
+		t.Fatal(w.Code, requests)
+	}
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, formRequest("POST", "/register", url.Values{"configuration": {`{"environments":[],"services":[]}`}}))
+	if requests != 1 || w.Code != 303 {
+		t.Fatal(w.Code, requests)
+	}
+}
+
 func TestHandlerLifecycleActionsSendOneMatchingRequest(t *testing.T) {
 	var mu sync.Mutex
 	counts := map[string]int{}

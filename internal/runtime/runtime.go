@@ -32,9 +32,15 @@ func classify(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &Failure{Code: "timeout"}
 	}
+	var transport *ssh.Error
+	if errors.As(err, &transport) && transport.Kind == ssh.FailureTransport {
+		return &Failure{Code: "host-unreachable"}
+	}
 	var f *jinushi.Failure
 	if errors.As(err, &f) {
 		switch f.Kind {
+		case jinushi.KindBootstrapFailed, jinushi.KindBootstrapNotConfigured, jinushi.KindSupervisorUnavailable:
+			return &Failure{Code: "jinushi-unavailable"}
 		case jinushi.KindTimeout:
 			return &Failure{Code: "timeout"}
 		case jinushi.KindUncertain, jinushi.KindAmbiguous, jinushi.KindNotStopped:
@@ -51,12 +57,14 @@ type binding struct {
 type Runtime struct {
 	mu         sync.Mutex
 	registry   *registry.Snapshot
+	store      *config.Store
 	ssh        remoteRunner
 	bindings   map[string]binding
 	services   map[string]registry.Service
 	tunnels    *tunnel.Manager
 	observer   *health.Observer
 	pending    map[string]string
+	jinushi    map[string]string
 	closed     bool
 	httpClient *http.Client
 }
@@ -79,7 +87,12 @@ func New(store *config.Store) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Compose(snapshot, client, manager)
+	r, err := Compose(snapshot, client, manager)
+	if err != nil {
+		return nil, err
+	}
+	r.store = store
+	return r, nil
 }
 
 func loadSnapshot(store *config.Store) (*registry.Snapshot, error) {
@@ -98,7 +111,19 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 	if snapshot == nil || client == nil || manager == nil {
 		return nil, errors.New("registry, SSH client and tunnel manager are required")
 	}
-	r := &Runtime{registry: snapshot, ssh: client, bindings: map[string]binding{}, services: map[string]registry.Service{}, tunnels: manager, pending: map[string]string{}, httpClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	r := &Runtime{ssh: client, tunnels: manager, pending: map[string]string{}, jinushi: map[string]string{}, httpClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	if err := r.configure(snapshot); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *Runtime) configure(snapshot *registry.Snapshot) error {
+	r.registry = snapshot
+	r.jinushi = map[string]string{}
+	r.bindings = map[string]binding{}
+	r.services = map[string]registry.Service{}
+	client := r.ssh
 	targets := []health.EnvironmentTarget{}
 	observerProbeTimeout := probeTimeout
 	for _, env := range snapshot.Environments() {
@@ -106,12 +131,12 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 		opts := jinushi.Options{StateDir: env.Jinushi.StateDir, SupervisorStartCommand: env.Jinushi.SupervisorStartCommand, CommandTimeout: commandTimeout}
 		control, err := jinushi.New(ex, opts)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		opts.SupervisorStartCommand = nil
 		observe, err := jinushi.New(ex, opts)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		r.bindings[string(env.ID)] = binding{env, control, observe}
 		targets = append(targets, health.EnvironmentTarget{ID: string(env.ID)})
@@ -136,10 +161,77 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 	}
 	observer, err := health.New(targets, health.Probes{Connectivity: r.connectivity, Process: r.process, Readiness: r.readiness, Endpoint: r.endpointState}, health.Options{PollInterval: 5 * time.Second, ProbeTimeout: observerProbeTimeout})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	r.observer = observer
-	return r, nil
+	return nil
+}
+
+func equalArgv(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Register installs the first validated registry atomically in the sole runtime.
+// Existing registrations are deliberately not replaced while tunnels may be owned.
+func (r *Runtime) Register(snapshot *registry.Snapshot) error {
+	if snapshot == nil {
+		return &Failure{Code: "invalid-request"}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return &Failure{Code: "lifecycle-conflict"}
+	}
+	// An environment-only first draft may be completed with service definitions.
+	// Never replace a registry that already owns services or tunnels.
+	current := r.registry.Environments()
+	if len(current) != 0 {
+		incoming := snapshot.Environments()
+		if len(current) != 1 || len(r.registry.Services()) != 0 || len(snapshot.Services()) == 0 || len(incoming) != 1 || current[0].ID != incoming[0].ID || current[0].SSHHost != incoming[0].SSHHost || current[0].Jinushi.StateDir != incoming[0].Jinushi.StateDir || !equalArgv(current[0].Jinushi.SupervisorStartCommand, incoming[0].Jinushi.SupervisorStartCommand) {
+			return &Failure{Code: "lifecycle-conflict"}
+		}
+	}
+	if r.store == nil {
+		return &Failure{Code: "registration-unavailable"}
+	}
+	// Prepare clients and observer before committing the persistent state.
+	candidate := &Runtime{ssh: r.ssh, tunnels: r.tunnels, httpClient: r.httpClient}
+	if err := candidate.configure(snapshot); err != nil {
+		return &Failure{Code: "invalid-request"}
+	}
+	if err := r.store.Save(snapshot); err != nil {
+		return err
+	}
+	// Rebind probe closures to the live runtime, not the temporary candidate.
+	return r.configure(snapshot)
+}
+
+// EnsureJinushi is an explicit bootstrap-capable operation; background polls
+// only use the observation-only client.
+func (r *Runtime) EnsureJinushi(ctx context.Context, env string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return &Failure{Code: "lifecycle-conflict"}
+	}
+	b, ok := r.bindings[env]
+	if !ok {
+		return &Failure{Code: "unknown-identity"}
+	}
+	if err := b.control.EnsureReady(ctx); err != nil {
+		r.jinushi[env] = "unavailable"
+		return classify(err)
+	}
+	r.jinushi[env] = "ready"
+	return nil
 }
 func (r *Runtime) service(env, id string) (registry.Service, error) {
 	s, ok := r.services[key(env, id)]
@@ -246,7 +338,7 @@ func (r *Runtime) Ensure(ctx context.Context, env, id, endpoint string) (Endpoin
 		if string(ep.ID) == endpoint {
 			snap, err := r.ensure(ctx, s, ep)
 			if err != nil {
-				return Endpoint{}, classify(err)
+				return Endpoint{}, &Failure{Code: "tunnel-unavailable"}
 			}
 			return r.endpointView(s, ep, health.EndpointObservation{State: health.EndpointAvailable}, snap), nil
 		}
@@ -340,8 +432,22 @@ func (r *Runtime) Poll(ctx context.Context) error {
 			r.ensureHealth(ctx, s)
 		}
 	}
-	r.mu.Unlock()
-	return r.observer.Poll(ctx)
+	defer r.mu.Unlock()
+	if err := r.observer.Poll(ctx); err != nil {
+		return err
+	}
+	for _, env := range r.observer.Snapshot().Environments {
+		if env.State != health.ConnectivityConnected {
+			r.jinushi[env.ID] = "unknown"
+			continue
+		}
+		if err := r.bindings[env.ID].observe.EnsureReady(ctx); err != nil {
+			r.jinushi[env.ID] = "unavailable"
+		} else {
+			r.jinushi[env.ID] = "ready"
+		}
+	}
+	return nil
 }
 func (r *Runtime) Run(ctx context.Context) error {
 	if err := r.Poll(ctx); err != nil {
@@ -374,6 +480,7 @@ type State struct {
 type Environment struct {
 	ID           string                   `json:"id"`
 	Connectivity health.ConnectivityState `json:"connectivity"`
+	Jinushi      string                   `json:"jinushi"`
 	Error        string                   `json:"error"`
 	Services     []Service                `json:"services"`
 }
@@ -454,7 +561,10 @@ func (r *Runtime) Snapshot() State {
 	observed := r.observer.Snapshot()
 	result := State{Version: 1, Environments: []Environment{}}
 	for _, e := range r.registry.Environments() {
-		view := Environment{ID: string(e.ID), Connectivity: health.ConnectivityUnknown, Services: []Service{}}
+		view := Environment{ID: string(e.ID), Connectivity: health.ConnectivityUnknown, Jinushi: "unknown", Services: []Service{}}
+		if status := r.jinushi[view.ID]; status != "" {
+			view.Jinushi = status
+		}
 		for _, o := range observed.Environments {
 			if o.ID == view.ID {
 				view.Connectivity = o.State

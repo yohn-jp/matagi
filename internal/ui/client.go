@@ -81,6 +81,7 @@ type State struct {
 type Environment struct {
 	ID           string    `json:"id"`
 	Connectivity string    `json:"connectivity"`
+	Jinushi      string    `json:"jinushi"`
 	Error        string    `json:"error"`
 	Services     []Service `json:"services"`
 }
@@ -161,6 +162,27 @@ func (c *Client) GetState(ctx context.Context) (State, error) {
 		return State{}, fmt.Errorf("unsupported Matagi API version %d", state.Version)
 	}
 	return state, nil
+}
+
+// Register sends a complete registry document; the API validates it before persistence.
+func (c *Client) EnsureJinushi(ctx context.Context, environmentID string) error {
+	var response struct {
+		Version int `json:"version"`
+	}
+	if err := c.post(ctx, "/v1/environment/ensure-jinushi", struct {
+		EnvironmentID string `json:"environmentId"`
+	}{environmentID}, &response); err != nil {
+		return err
+	}
+	if response.Version != apiVersion {
+		return errors.New("invalid Jinushi response")
+	}
+	return nil
+}
+
+func (c *Client) Register(ctx context.Context, document json.RawMessage) error {
+	var state State
+	return c.post(ctx, "/v1/environment/register", document, &state)
 }
 
 func (c *Client) Start(ctx context.Context, req ServiceRequest) (ServiceResult, error) {
