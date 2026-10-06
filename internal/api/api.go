@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yohn-jp/matagi/internal/registry"
 	"github.com/yohn-jp/matagi/internal/runtime"
 )
 
@@ -24,6 +25,15 @@ type Runtime interface {
 type Handler struct{ runtime Runtime }
 
 func New(r Runtime) http.Handler { return &Handler{runtime: r} }
+
+// Registration is available only on the production runtime, not on read-only API fakes.
+type registrar interface {
+	Register(*registry.Snapshot) error
+}
+type registration struct {
+	Environments []registry.Environment `json:"environments"`
+	Services     []registry.Service     `json:"services"`
+}
 
 type request struct {
 	EnvironmentID string `json:"environmentId"`
@@ -49,6 +59,69 @@ func failure(w http.ResponseWriter, status int, code string) {
 	}{code, code}})
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/environment/ensure-jinushi" && r.Method == http.MethodPost {
+		owner, ok := h.runtime.(interface {
+			EnsureJinushi(context.Context, string) error
+		})
+		if !ok {
+			failure(w, 409, "registration-unavailable")
+			return
+		}
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 4097))
+		decoder.DisallowUnknownFields()
+		var input struct {
+			EnvironmentID string `json:"environmentId"`
+		}
+		var trailing any
+		if decoder.Decode(&input) != nil || decoder.Decode(&trailing) != io.EOF || strings.TrimSpace(input.EnvironmentID) == "" {
+			failure(w, 400, "invalid-request")
+			return
+		}
+		if err := owner.EnsureJinushi(r.Context(), input.EnvironmentID); err != nil {
+			var f *runtime.Failure
+			if errors.As(err, &f) {
+				failure(w, 502, f.Code)
+			} else {
+				failure(w, 502, "remote-failure")
+			}
+			return
+		}
+		write(w, 200, struct {
+			Version int `json:"version"`
+		}{1})
+		return
+	}
+	if r.URL.Path == "/v1/environment/register" && r.Method == http.MethodPost {
+		owner, ok := h.runtime.(registrar)
+		if !ok {
+			failure(w, 409, "registration-unavailable")
+			return
+		}
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 65537))
+		decoder.DisallowUnknownFields()
+		var input registration
+		var trailing any
+		if decoder.Decode(&input) != nil || decoder.Decode(&trailing) != io.EOF || len(input.Environments) != 1 {
+			failure(w, 400, "invalid-request")
+			return
+		}
+		snapshot, err := registry.NewSnapshot(input.Environments, input.Services)
+		if err != nil {
+			failure(w, 400, "invalid-request")
+			return
+		}
+		if err := owner.Register(snapshot); err != nil {
+			var f *runtime.Failure
+			if errors.As(err, &f) && f.Code == "lifecycle-conflict" {
+				failure(w, 409, f.Code)
+			} else {
+				failure(w, 500, "registration-failed")
+			}
+			return
+		}
+		write(w, 200, h.runtime.Snapshot())
+		return
+	}
 	if r.URL.Path == "/v1/state" && r.Method == http.MethodGet {
 		write(w, 200, h.runtime.Snapshot())
 		return

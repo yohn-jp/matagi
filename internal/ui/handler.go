@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"html/template"
 	"net/http"
@@ -40,6 +41,26 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.index(w, r, "")
+	case "/jinushi":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		if err := parseForm(w, r); err != nil || r.PostForm.Get("environmentId") == "" {
+			http.Error(w, "invalid environment", http.StatusBadRequest)
+			return
+		}
+		if err := h.client.EnsureJinushi(r.Context(), r.PostForm.Get("environmentId")); err != nil {
+			h.showError(w, apiStatus(err), bounded(err.Error(), maxErrorMessage))
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	case "/register":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.register(w, r)
 	case "/action":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -81,6 +102,23 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request, message string) 
 		}
 	}
 	h.render(w, page{State: &state, Error: message})
+}
+
+func (h *handler) register(w http.ResponseWriter, r *http.Request) {
+	if err := parseForm(w, r); err != nil {
+		http.Error(w, "invalid registration", http.StatusBadRequest)
+		return
+	}
+	input := []byte(r.PostForm.Get("configuration"))
+	if !json.Valid(input) {
+		h.showError(w, http.StatusBadRequest, "Enter a valid registry JSON document.")
+		return
+	}
+	if err := h.client.Register(r.Context(), json.RawMessage(input)); err != nil {
+		h.showError(w, apiStatus(err), bounded(err.Error(), maxErrorMessage))
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (h *handler) action(w http.ResponseWriter, r *http.Request) {
@@ -238,6 +276,10 @@ button { cursor: pointer; padding: .45rem .8rem; }
 {{ $environmentID := .ID }}
 <h2>Environment {{.ID}}</h2>
 <p>Connectivity: {{.Connectivity}}</p>
+<p>Jinushi: {{.Jinushi}}</p>
+{{if not .Services}}<p>No services registered. Paste a complete document with the same environment and Inari/Yokodori definitions to finish setup.</p>
+<form method="post" action="/register"><label for="configuration">Add Inari and Yokodori (registry JSON)</label><br><textarea id="configuration" name="configuration" rows="16" cols="80" required></textarea><br><button type="submit">Register services</button></form>{{end}}
+<form method="post" action="/jinushi"><input type="hidden" name="environmentId" value="{{.ID}}"><button type="submit">Check / start Jinushi</button></form>
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
 {{range .Services}}
 <article class="service">
@@ -266,7 +308,8 @@ button { cursor: pointer; padding: .45rem .8rem; }
 {{end}}
 </section>
 {{else}}
-<p>No environments are registered.</p>
+<p>No environments are registered. Add a development environment using a registry document. See docs/getting-started.md for a complete Inari and Yokodori example. SSH authentication remains in your system OpenSSH configuration.</p>
+<form method="post" action="/register"><label for="configuration">Add development environment (registry JSON)</label><br><textarea id="configuration" name="configuration" rows="16" cols="80" required>{"environments":[{"id":"development","sshHost":"development","jinushi":{"supervisorStartCommand":["systemctl","--user","start","jinushi"]}}],"services":[]}</textarea><br><button type="submit">Add development environment</button></form>
 {{end}}
 {{else}}
 <p>Waiting for the Matagi service API.</p>
