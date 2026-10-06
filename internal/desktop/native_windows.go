@@ -33,8 +33,10 @@ var (
 	procDispatchMessageW = user32.NewProc("DispatchMessageW")
 	procPostMessageW     = user32.NewProc("PostMessageW")
 	procPostQuitMessage  = user32.NewProc("PostQuitMessage")
-	procFindWindowW      = user32.NewProc("FindWindowW")
-	procSetForegroundW   = user32.NewProc("SetForegroundWindow")
+	procFindWindowW             = user32.NewProc("FindWindowW")
+	procSetForegroundW          = user32.NewProc("SetForegroundWindow")
+	procRegisterWindowMessageW  = user32.NewProc("RegisterWindowMessageW")
+	procAllowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
 	procLoadCursorW      = user32.NewProc("LoadCursorW")
 	procMessageBoxW      = user32.NewProc("MessageBoxW")
 	activeShellMu        sync.Mutex
@@ -90,6 +92,7 @@ type shell struct {
 	initializing bool
 	quitPending  bool
 	closed       bool
+	activateMsg  uint32
 }
 
 type native struct{}
@@ -131,17 +134,29 @@ func (native) AcquireInstance() (func(), error) {
 }
 
 func (native) Activate() error {
+	userID, err := currentUserID()
+	if err != nil {
+		return err
+	}
 	class, err := windows.UTF16PtrFromString(windowClass)
 	if err != nil {
 		return err
 	}
+	messageName, err := windows.UTF16PtrFromString(ActivateMessageName(userID))
+	if err != nil {
+		return err
+	}
+	message, _, callErr := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(messageName)))
+	if message == 0 {
+		return fmt.Errorf("registering desktop activation message: %w", callErr)
+	}
+	procAllowSetForegroundWindow.Call(^uintptr(0))
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(class)), 0)
 		if hwnd != 0 {
-			procShowWindow.Call(hwnd, swShowNormal)
-			if ok, _, callErr := procSetForegroundW.Call(hwnd); ok == 0 {
-				return fmt.Errorf("activating existing Matagi window: %w", callErr)
+			if ok, _, err := procPostMessageW.Call(hwnd, message, 0, 0); ok == 0 {
+				return fmt.Errorf("posting desktop activation message: %w", err)
 			}
 			return nil
 		}
@@ -195,6 +210,19 @@ func (native) Open(ctx context.Context, w Window) error {
 	}
 
 	s := &shell{}
+	userID, err := currentUserID()
+	if err != nil {
+		return err
+	}
+	messageName, err := windows.UTF16PtrFromString(ActivateMessageName(userID))
+	if err != nil {
+		return err
+	}
+	message, _, callErr := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(messageName)))
+	if message == 0 {
+		return fmt.Errorf("registering desktop activation message: %w", callErr)
+	}
+	s.activateMsg = uint32(message)
 	activeShellMu.Lock()
 	if activeShell != nil {
 		activeShellMu.Unlock()
@@ -357,6 +385,15 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 		case wmDestroy:
 			s.hwnd = 0
 			procPostQuitMessage.Call(0)
+			return 0
+		}
+		if s.activateMsg != 0 && uint32(message) == s.activateMsg {
+			procShowWindow.Call(hwnd, swShowNormal)
+			procSetForegroundW.Call(hwnd)
+			if s.chromium != nil {
+				s.chromium.Resize()
+				s.chromium.Focus()
+			}
 			return 0
 		}
 	}
