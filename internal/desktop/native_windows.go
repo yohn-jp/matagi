@@ -45,6 +45,7 @@ var (
 	wndProcOnce     sync.Once
 	wndProcCallback uintptr
 )
+
 const (
 	wsOverlappedWindow = 0x00CF0000
 	cwUseDefault       = 0x80000000
@@ -218,11 +219,11 @@ func (native) Open(ctx context.Context, w Window) error {
 	if err != nil {
 		return err
 	}
-	message, _, callErr := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(messageName)))
-	if message == 0 {
+	activateMessageID, _, callErr := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(messageName)))
+	if activateMessageID == 0 {
 		return fmt.Errorf("registering desktop activation message: %w", callErr)
 	}
-	s.activateMsg = uint32(message)
+	s.activateMsg = uint32(activateMessageID)
 	activeShellMu.Lock()
 	if activeShell != nil {
 		activeShellMu.Unlock()
