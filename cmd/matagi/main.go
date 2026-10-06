@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -28,24 +27,60 @@ type lifecycle interface {
 }
 
 func main() {
+	if goruntime.GOOS == "windows" {
+		desktop.HideOwnedConsole()
+	}
+	if err := runProduct(); err != nil {
+		fmt.Fprintln(os.Stderr, "matagi:", err)
+		if goruntime.GOOS == "windows" {
+			desktop.Native().ReportError("Matagi could not start", err.Error())
+		}
+		os.Exit(1)
+	}
+}
+
+func runProduct() error {
+	if goruntime.GOOS == "windows" {
+		platform := desktop.Native()
+		_, release, err := desktop.Preflight(platform)
+		if errors.Is(err, desktop.ErrAlreadyRunning) {
+			if err := platform.Activate(); err != nil {
+				return fmt.Errorf("activating running Matagi: %w", err)
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer release()
+		return runConfiguredDesktop(platform)
+	}
+
 	store, err := config.NewUserStore()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	rt, err := runtime.New(store)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if goruntime.GOOS == "windows" {
-		err = runDesktop(ctx, rt, desktop.Native())
-	} else {
-		err = runHeadless(ctx, rt)
-	}
+	return runHeadless(ctx, rt)
+}
+
+func runConfiguredDesktop(platform desktop.Platform) error {
+	store, err := config.NewUserStore()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
+	rt, err := runtime.New(store)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runDesktop(ctx, rt, platform)
 }
 
 func runHeadless(parent context.Context, rt lifecycle) error {
