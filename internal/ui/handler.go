@@ -53,6 +53,7 @@ func (h *handler) validFormToken(value string) bool {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
 	if r.Method == http.MethodPost {
 		if err := parseForm(w, r); err != nil {
 			http.Error(w, "invalid form submission", http.StatusBadRequest)
@@ -292,11 +293,15 @@ func (h *handler) render(w http.ResponseWriter, data page) {
 	h.renderStatus(w, http.StatusOK, data)
 }
 
-func (h *handler) renderStatus(w http.ResponseWriter, status int, data page) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 	w.Header().Set("Cache-Control", "no-store")
+}
+
+func (h *handler) renderStatus(w http.ResponseWriter, status int, data page) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := pageTemplate.Execute(w, data); err != nil {
 		return
