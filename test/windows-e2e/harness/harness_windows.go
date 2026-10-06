@@ -26,9 +26,22 @@ var user32 = syscall.NewLazyDLL("user32.dll")
 var findWindow = user32.NewProc("FindWindowW")
 var postMessage = user32.NewProc("PostMessageW")
 
+type Options struct {
+	Snapshot   *registry.Snapshot
+	PathPrefix string
+	Env        map[string]string
+}
+
 // Start launches the downloaded production candidate with an isolated empty
 // registry. It never points the process at a real development host.
 func Start(t *testing.T) (apiURL, uiURL string) {
+	t.Helper()
+	return StartConfigured(t, Options{})
+}
+
+// StartConfigured launches the exact downloaded candidate with a caller-owned
+// validated registry and optional deterministic transport fixture boundary.
+func StartConfigured(t *testing.T, options Options) (apiURL, uiURL string) {
 	t.Helper()
 	dir := os.Getenv("MATAGI_E2E_CANDIDATE")
 	source := os.Getenv("MATAGI_E2E_SOURCE")
@@ -39,6 +52,7 @@ func Start(t *testing.T) (apiURL, uiURL string) {
 	if _, err := identity.Verify(dir, source, sum); err != nil {
 		t.Fatal(err)
 	}
+
 	home := t.TempDir()
 	t.Setenv("APPDATA", home)
 	t.Setenv("LOCALAPPDATA", home)
@@ -46,15 +60,25 @@ func Start(t *testing.T) (apiURL, uiURL string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := registry.NewSnapshot(nil, nil)
-	if err != nil {
-		t.Fatal(err)
+	snapshot := options.Snapshot
+	if snapshot == nil {
+		snapshot, err = registry.NewSnapshot(nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := store.Save(snapshot); err != nil {
 		t.Fatal(err)
 	}
+
 	cmd := exec.Command(filepath.Join(dir, identity.File))
 	cmd.Env = os.Environ()
+	if options.PathPrefix != "" {
+		cmd.Env = replaceEnv(cmd.Env, "PATH", options.PathPrefix+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	for key, value := range options.Env {
+		cmd.Env = replaceEnv(cmd.Env, key, value)
+	}
 	out := new(strings.Builder)
 	cmd.Stderr = out
 	if err := cmd.Start(); err != nil {
@@ -79,6 +103,7 @@ func Start(t *testing.T) (apiURL, uiURL string) {
 			t.Error("candidate failed bounded desktop shutdown")
 		}
 	})
+
 	deadline := time.Now().Add(30 * time.Second)
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	for time.Now().Before(deadline) {
@@ -97,7 +122,7 @@ func Start(t *testing.T) (apiURL, uiURL string) {
 				if err == nil {
 					body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 					resp.Body.Close()
-					if resp.StatusCode == 200 && strings.Contains(string(body), `"version":1`) {
+					if resp.StatusCode == http.StatusOK && strings.Contains(string(body), `"version":1`) {
 						apiURL = origin
 					}
 				}
@@ -106,7 +131,7 @@ func Start(t *testing.T) (apiURL, uiURL string) {
 				if err == nil {
 					body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 					resp.Body.Close()
-					if resp.StatusCode == 200 && strings.Contains(string(body), "Matagi") {
+					if resp.StatusCode == http.StatusOK && strings.Contains(string(body), "Matagi") {
 						uiURL = origin
 					}
 				}
@@ -120,6 +145,18 @@ func Start(t *testing.T) (apiURL, uiURL string) {
 	t.Fatalf("candidate listeners not ready (stderr: %s)", out.String())
 	return "", ""
 }
+
+func replaceEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, entry := range env {
+		if len(entry) >= len(prefix) && strings.EqualFold(entry[:len(prefix)], prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
 func listeningPorts(pid int) ([]int, error) {
 	out, err := exec.Command("netstat", "-ano", "-p", "tcp").Output()
 	if err != nil {
@@ -145,6 +182,7 @@ func listeningPorts(pid int) ([]int, error) {
 	}
 	return ports, nil
 }
+
 func Get(t *testing.T, url string) string {
 	t.Helper()
 	resp, err := (&http.Client{Timeout: 3 * time.Second}).Get(url)
@@ -156,7 +194,7 @@ func Get(t *testing.T, url string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET %s: %s %s", url, resp.Status, body)
 	}
 	return string(body)

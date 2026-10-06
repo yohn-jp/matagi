@@ -36,6 +36,7 @@ func hash(path string) (string, int64, error) {
 	n, err := io.Copy(h, f)
 	return hex.EncodeToString(h.Sum(nil)), n, err
 }
+
 func read(path string, v any) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -52,6 +53,7 @@ func read(path string, v any) error {
 	}
 	return nil
 }
+
 func write(path string, v any) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -59,6 +61,7 @@ func write(path string, v any) error {
 	}
 	return os.WriteFile(path, append(b, '\n'), 0644)
 }
+
 func Record(dir, source string) (Candidate, error) {
 	if !commitPattern.MatchString(source) {
 		return Candidate{}, errors.New("invalid source SHA")
@@ -73,6 +76,7 @@ func Record(dir, source string) (Candidate, error) {
 	c := Candidate{source, File, sum, n}
 	return c, write(filepath.Join(dir, "candidate.json"), c)
 }
+
 func Verify(dir, source, sum string) (Candidate, error) {
 	if !commitPattern.MatchString(source) || !hashPattern.MatchString(sum) {
 		return Candidate{}, errors.New("missing or invalid out-of-band identity")
@@ -103,7 +107,7 @@ type Evidence struct {
 
 func RecordEvidence(path string, e Evidence) error { return write(path, e) }
 
-var Shards = []string{"startup", "surface", "transport"}
+var Shards = []string{"startup", "surface", "transport", "lifecycle"}
 
 type Certification struct {
 	Source string `json:"source"`
@@ -131,7 +135,9 @@ func Aggregate(candidateDir, evidenceDir, source, sum string, jobsOK bool) (Cert
 	}
 	return Certification{source, sum, c.File, true}, nil
 }
+
 func SaveCertification(path string, c Certification) error { return write(path, c) }
+
 func CheckCertification(path, dir, source, sum string) error {
 	if _, err := Verify(dir, source, sum); err != nil {
 		return err

@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [startup, surface, transport]
+        shard: [startup, surface, transport, lifecycle]
     env:
       MATAGI_E2E_CANDIDATE: ${{ github.workspace }}\candidate
       MATAGI_E2E_SOURCE: ${{ github.sha }}
@@ -75,6 +75,15 @@ jobs:
           if (-not $env:MATAGI_E2E_SHA256) { throw 'missing candidate SHA-256' }
           go run ./test/windows-e2e/cmd/certify -candidate candidate -source $env:MATAGI_E2E_SOURCE -sha256 $env:MATAGI_E2E_SHA256 verify
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build deterministic SSH boundary fixture
+        if: ${{ matrix.shard == 'lifecycle' }}
+        shell: pwsh
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP 'matagi-ssh-fixture'
+          New-Item -ItemType Directory -Force $fixture | Out-Null
+          go build -o (Join-Path $fixture 'ssh.exe') ./test/windows-e2e/fixture/ssh
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "MATAGI_E2E_SSH_FIXTURE_DIR=$fixture" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Execute production-candidate shard
         shell: pwsh
         run: |
@@ -124,10 +133,6 @@ jobs:
           test "$CANDIDATE_JOB" = success && test "$SHARD_JOB" = success
           test -n "$CANDIDATE_SHA"
           go run ./test/windows-e2e/cmd/certify -candidate candidate -evidence evidence -source "$GITHUB_SHA" -sha256 "$CANDIDATE_SHA" -jobs-ok -out certification.json aggregate
-          # The portable peer/lifecycle/tunnel fixture is not yet present.
-          # Do not publish partial hosted-runner evidence as certification.
-          echo 'required fixture-backed lifecycle and tunnel checks are missing' >&2
-          exit 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ success() }}
         with:
