@@ -23,7 +23,8 @@ import (
 )
 
 var user32 = syscall.NewLazyDLL("user32.dll")
-var findWindow = user32.NewProc("FindWindowW")
+var findWindowEx = user32.NewProc("FindWindowExW")
+var getWindowThreadProcessID = user32.NewProc("GetWindowThreadProcessId")
 var postMessage = user32.NewProc("PostMessageW")
 
 type Options struct {
@@ -86,9 +87,8 @@ func StartConfigured(t *testing.T, options Options) (apiURL, uiURL string) {
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
+	var hwnd uintptr
 	t.Cleanup(func() {
-		class, _ := syscall.UTF16PtrFromString("MatagiWebView2Window")
-		hwnd, _, _ := findWindow.Call(uintptr(unsafe.Pointer(class)), 0)
 		if hwnd != 0 {
 			postMessage.Call(hwnd, 0x0010, 0, 0)
 		}
@@ -136,14 +136,37 @@ func StartConfigured(t *testing.T, options Options) (apiURL, uiURL string) {
 					}
 				}
 			}
-			if apiURL != "" && uiURL != "" {
+			if hwnd == 0 {
+				hwnd = candidateWindow(cmd.Process.Pid)
+			}
+			if apiURL != "" && uiURL != "" && hwnd != 0 {
 				return apiURL, uiURL
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("candidate listeners not ready (stderr: %s)", out.String())
+	t.Fatalf("candidate listeners/window not ready (stderr: %s)", out.String())
 	return "", ""
+}
+
+func candidateWindow(pid int) uintptr {
+	class, err := syscall.UTF16PtrFromString("MatagiWebView2Window")
+	if err != nil {
+		return 0
+	}
+	var after uintptr
+	for {
+		hwnd, _, _ := findWindowEx.Call(0, after, uintptr(unsafe.Pointer(class)), 0)
+		if hwnd == 0 {
+			return 0
+		}
+		var owner uint32
+		getWindowThreadProcessID.Call(hwnd, uintptr(unsafe.Pointer(&owner)))
+		if int(owner) == pid {
+			return hwnd
+		}
+		after = hwnd
+	}
 }
 
 func replaceEnv(env []string, key, value string) []string {
