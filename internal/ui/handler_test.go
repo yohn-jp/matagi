@@ -235,9 +235,12 @@ func TestStateChangingFormsRequireTokenAndErrorPagesKeepSecurityHeaders(t *testi
 }
 
 func formRequest(method, target string, form url.Values, token string) *http.Request {
-	form = form.Clone()
-	form.Set("token", token)
-	request := httptest.NewRequest(method, target, strings.NewReader(form.Encode()))
+	values := make(url.Values, len(form)+1)
+	for key, items := range form {
+		values[key] = append([]string(nil), items...)
+	}
+	values.Set("token", token)
+	request := httptest.NewRequest(method, target, strings.NewReader(values.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return request
 }
