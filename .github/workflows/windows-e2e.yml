@@ -1,0 +1,205 @@
+name: Portable Windows candidate certification
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: windows-candidate-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  candidate:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.identity.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - name: Build the sole production candidate
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          New-Item -ItemType Directory candidate | Out-Null
+          go build -o candidate/matagi.exe ./cmd/matagi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Bind source and digest
+        id: identity
+        shell: pwsh
+        run: |
+          go run ./test/windows-e2e/cmd/certify -candidate candidate -source $env:GITHUB_SHA record | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-candidate
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 30
+  shard:
+    needs: candidate
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [startup, surface, transport]
+    env:
+      MATAGI_E2E_CANDIDATE: ${{ github.workspace }}\candidate
+      MATAGI_E2E_SOURCE: ${{ github.sha }}
+      MATAGI_E2E_SHA256: ${{ needs.candidate.outputs.sha256 }}
+      MATAGI_E2E_SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-candidate
+          path: candidate
+      - name: Verify downloaded candidate
+        shell: pwsh
+        run: |
+          if (-not $env:MATAGI_E2E_SHA256) { throw 'missing candidate SHA-256' }
+          go run ./test/windows-e2e/cmd/certify -candidate candidate -source $env:MATAGI_E2E_SOURCE -sha256 $env:MATAGI_E2E_SHA256 verify
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Execute production-candidate shard
+        shell: pwsh
+        run: |
+          go test -count=1 -timeout 20m -v ./test/windows-e2e/${{ matrix.shard }}/...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record shard PASS only after tests succeed
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force evidence/${{ matrix.shard }} | Out-Null
+          go run ./test/windows-e2e/cmd/certify -candidate candidate -source $env:MATAGI_E2E_SOURCE -sha256 $env:MATAGI_E2E_SHA256 -evidence evidence -shard $env:MATAGI_E2E_SHARD evidence
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-e2e-${{ matrix.shard }}
+          path: evidence/${{ matrix.shard }}/
+          if-no-files-found: error
+          retention-days: 30
+  aggregate:
+    needs: [candidate, shard]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: ${{ needs.candidate.result == 'success' }}
+        with:
+          name: windows-candidate
+          path: candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: windows-e2e-*
+          path: evidence
+      - name: Fail-closed aggregate
+        env:
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha256 }}
+          CANDIDATE_JOB: ${{ needs.candidate.result }}
+          SHARD_JOB: ${{ needs.shard.result }}
+        run: |
+          set -euo pipefail
+          test "$CANDIDATE_JOB" = success && test "$SHARD_JOB" = success
+          test -n "$CANDIDATE_SHA"
+          go run ./test/windows-e2e/cmd/certify -candidate candidate -evidence evidence -source "$GITHUB_SHA" -sha256 "$CANDIDATE_SHA" -jobs-ok -out certification.json aggregate
+          # The portable peer/lifecycle/tunnel fixture is not yet present.
+          # Do not publish partial hosted-runner evidence as certification.
+          echo 'required fixture-backed lifecycle and tunnel checks are missing' >&2
+          exit 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ success() }}
+        with:
+          name: windows-certification
+          path: certification.json
+          if-no-files-found: error
+          retention-days: 90
+  release:
+    needs: [candidate, aggregate]
+    if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: matagi-development-release
+      cancel-in-progress: false
+    env:
+      ASSET: matagi-windows-amd64.exe
+      CANDIDATE_SHA: ${{ needs.candidate.outputs.sha256 }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-candidate
+          path: candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-certification
+          path: certification
+      - name: Verify certified bytes and stage assets
+        run: |
+          set -euo pipefail
+          test -n "$CANDIDATE_SHA"
+          go run ./test/windows-e2e/cmd/certify -candidate candidate -source "$GITHUB_SHA" -sha256 "$CANDIDATE_SHA" -out certification/certification.json release-check
+          mkdir release
+          cp candidate/matagi.exe "release/$ASSET"
+          test "$(sha256sum "release/$ASSET" | cut -d ' ' -f1)" = "$CANDIDATE_SHA"
+          printf '%s  %s\n' "$CANDIDATE_SHA" "$ASSET" > "release/$ASSET.sha256"
+      - name: Allocate 0.1.N-dev and publish prerelease
+        id: publish
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPOSITORY/git/matching-refs/tags/0.1." --jq '.[].ref' > "$RUNNER_TEMP/line-tags"
+          max=0
+          declare -A occupied=()
+          while IFS= read -r ref; do
+            if [[ "$ref" =~ ^refs/tags/0\.1\.([0-9]{1,17})-dev$ ]]; then
+              n=$((10#${BASH_REMATCH[1]})); if (( n > max )); then max=$n; fi
+            fi
+            if [[ "$ref" =~ ^refs/tags/0\.1\.([0-9]{1,17})([-+].*)?$ ]]; then
+              occupied[$((10#${BASH_REMATCH[1]}))]=1
+            fi
+          done < "$RUNNER_TEMP/line-tags"
+          next=$((max+1))
+          while [[ -n "${occupied[$next]:-}" ]]; do next=$((next+1)); done
+          tag="0.1.$next-dev"
+          gh release create "$tag" "release/$ASSET" "release/$ASSET.sha256" \
+            --repo "$GH_REPOSITORY" --title "$tag" \
+            --notes "Portable hosted Windows certification of $GITHUB_SHA (SHA-256 $CANDIDATE_SHA). Not real-host certification." \
+            --target "$GITHUB_SHA" --prerelease --latest=false
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Verify published executable digest
+        env:
+          TAG: ${{ steps.publish.outputs.tag }}
+        run: |
+          mkdir published
+          gh release download "$TAG" --repo "$GH_REPOSITORY" --pattern "$ASSET" --dir published
+          test "$(sha256sum "published/$ASSET" | cut -d ' ' -f1)" = "$CANDIDATE_SHA"
