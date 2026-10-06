@@ -226,6 +226,9 @@ func TestStateChangingFormsRequireTokenAndErrorPagesKeepSecurityHeaders(t *testi
 	if response.Code != http.StatusForbidden || calls != 0 {
 		t.Fatalf("invalid token gate: status=%d calls=%d", response.Code, calls)
 	}
+	if response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("rejected form headers = %#v", response.Header())
+	}
 
 	response = httptest.NewRecorder()
 	h.(*handler).showError(response, http.StatusBadGateway, "failure")
