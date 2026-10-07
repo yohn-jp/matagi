@@ -3,6 +3,8 @@ package i18n
 import (
 	"bytes"
 	"testing"
+
+	"github.com/yohn-jp/matagi/internal/update"
 )
 
 func TestResolvePrefersSavedLocaleAndSupportsHostTags(t *testing.T) {
@@ -66,6 +68,17 @@ func TestJapaneseCatalogCoversOperatorAndBrowserCopy(t *testing.T) {
 		}
 		if japanese[message] == message {
 			t.Errorf("Japanese table did not translate %q", message)
+		}
+	}
+}
+
+func TestJapaneseCatalogCoversEveryNonemptyUpdateHint(t *testing.T) {
+	for class, message := range update.Hints {
+		if message == "" {
+			continue
+		}
+		if !Japanese.Has(message) || Japanese.T(message) == message {
+			t.Errorf("update hint %q for class %q has no Japanese translation", message, class)
 		}
 	}
 }
