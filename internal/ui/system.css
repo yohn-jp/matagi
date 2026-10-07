@@ -1,0 +1,250 @@
+/* Adapted from Hachidori's shared visual system for Matagi's desktop.
+   Change a role here, never per surface.
+
+   Composition comes before containers: the page is the canvas, and hierarchy
+   is carried by type, spacing, alignment and hairline rules (.section). There
+   is no card chrome, no state edge, no gradient, glow or glass, and no shadow
+   on ordinary content; elevation is reserved for a surface that sits above the
+   page (--shadow-pop: dialogs and popovers). */
+
+/* ---- color roles (dark is the default; light follows the OS) ----------- */
+:root {
+  --bg: #131519; --chrome: #0f1114; --surface: #181b20; --raised: #1f232a; --inset: #101216;
+  --line: #262a31; --line-2: #353b44;
+  --text: #e6e8eb; --text-2: #a4abb5; --text-3: #8a929d;
+  --accent: #6da6f7; --accent-ink: #0a1628; --accent-soft: rgba(109, 166, 247, .14);
+  --ok: #45bf8b; --ok-soft: rgba(69, 191, 139, .13);
+  --warn: #e3a63c; --warn-soft: rgba(227, 166, 60, .14);
+  --bad: #ef6a6a; --bad-soft: rgba(239, 106, 106, .13);
+  --idle: #8b939e; --idle-soft: rgba(139, 147, 158, .13);
+  --track: #262b33;
+
+  /* typography roles */
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+  --fs-display: 2.125rem;  /* the one state or figure a workspace is about */
+  --fs-title: 1.375rem;    /* workspace title (h1) */
+  --fs-figure: 1.5rem;     /* a result or progress figure */
+  --fs-value: 1.125rem;    /* metric value */
+  --fs-heading: .9375rem;  /* region heading (h2) */
+  --fs-body: .875rem;      /* running text and table cells */
+  --fs-small: .8125rem;    /* notes, sub-headings, secondary facts */
+  --fs-label: .6875rem;    /* uppercase labels: metric, column, group */
+  --fs-code: .8125rem;     /* raw evidence, paths, identifiers */
+
+  /* spacing scale (4px base) */
+  --sp-1: .25rem; --sp-2: .5rem; --sp-3: .75rem; --sp-4: 1rem; --sp-5: 1.5rem; --sp-6: 2rem; --sp-7: 2.5rem;
+
+  /* geometry */
+  --r: 6px; --r-lg: 8px; --r-pill: 99px;  /* radius is for controls and transient surfaces, never for grouping content */
+  --ctl-h: 2rem;           /* buttons, inputs, selects: one control height */
+  --measure: 72ch;         /* long-form prose only (.lede, .prose, .empty): a short helper or label uses its container's width */
+  --ws-max: 88rem;         /* workspace content width on wide windows */
+  --col-min: 14rem;        /* narrowest column that may hold a label and a machine identity */
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, .32);  /* the only elevation: dialogs and popovers */
+
+  /* focus and motion */
+  --focus: 2px solid var(--accent);
+  --focus-ring: 0 0 0 3px var(--accent-soft);
+  --dur-fast: .12s; --dur: .2s; --ease: cubic-bezier(.2, 0, 0, 1);
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f5f7; --chrome: #ebedf0; --surface: #ffffff; --raised: #f3f4f6; --inset: #ffffff;
+    --line: #e0e3e8; --line-2: #c9ced6;
+    --text: #15181c; --text-2: #4d5560; --text-3: #626a75;
+    --accent: #1f5fbf; --accent-ink: #ffffff; --accent-soft: rgba(31, 95, 191, .1);
+    --ok: #126f46; --ok-soft: rgba(23, 128, 79, .1);
+    --warn: #8f5b00; --warn-soft: rgba(190, 125, 0, .12);
+    --bad: #c42b2b; --bad-soft: rgba(196, 43, 43, .08);
+    --idle: #646d78; --idle-soft: rgba(100, 109, 120, .1);
+    --track: #e3e6ea;
+    --shadow-pop: 0 8px 24px rgba(21, 24, 28, .16);
+  }
+}
+
+/* semantic state: one tone per state, applied by class */
+.tone-ok { --tone: var(--ok); --tone-soft: var(--ok-soft); }
+.tone-warn { --tone: var(--warn); --tone-soft: var(--warn-soft); }
+.tone-bad { --tone: var(--bad); --tone-soft: var(--bad-soft); }
+.tone-idle { --tone: var(--idle); --tone-soft: var(--idle-soft); }
+.tone-active { --tone: var(--accent); --tone-soft: var(--accent-soft); }
+
+/* ---- base -------------------------------------------------------------- */
+/* Sizes are rem so the operator's text-size preference scales the whole UI;
+   the WebView itself is never magnified. */
+* { box-sizing: border-box; }
+html { font-size: 100%; }
+body { margin: 0; color: var(--text); background: var(--bg); font: var(--fs-body)/1.5 var(--font); -webkit-font-smoothing: antialiased; }
+h1 { font-size: var(--fs-title); font-weight: 650; line-height: 1.25; margin: 0; }
+h2 { font-size: var(--fs-heading); font-weight: 620; margin: 0; }
+h3 { font-size: var(--fs-label); font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--text-3); margin: 0 0 var(--sp-2); }
+p { margin: 0; }
+a { color: var(--accent); text-underline-offset: 2px; }
+code, pre, .mono { font-family: var(--mono); font-size: .92em; }
+/* A machine identity (model, runtime, digest, endpoint): one monospace
+   treatment, wrapped at the container edge. It is never given a width of its
+   own, so it cannot be squeezed into a character-wide column. */
+.id { font-family: var(--mono); font-size: var(--fs-code); font-weight: 500; overflow-wrap: break-word; hyphens: none; }
+.id .sub { font-family: var(--font); font-size: var(--fs-small); }
+.muted { color: var(--text-2); } .faint { color: var(--text-3); }
+.ok-t { color: var(--ok); } .warn-t { color: var(--warn); } .bad-t { color: var(--bad); }
+.num { font-variant-numeric: tabular-nums; }
+.vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+[hidden] { display: none !important; }
+:focus-visible { outline: var(--focus); outline-offset: 2px; }
+.skip { position: absolute; left: -999px; top: var(--sp-2); z-index: 20; padding: var(--sp-2) var(--sp-3); border-radius: var(--r); background: var(--surface); color: var(--text); }
+.skip:focus { left: var(--sp-3); }
+.lede { color: var(--text-2); max-width: var(--measure); }
+/* A note is short helper text: it fills the width of the section that holds it
+   and wraps only where that width ends. Long explanatory paragraphs opt in to
+   a reading measure with .prose. */
+.note { font-size: var(--fs-small); color: var(--text-3); text-wrap: pretty; }
+.note code { color: var(--text-2); }
+.prose { max-width: var(--measure); text-wrap: pretty; }
+.empty { color: var(--text-3); max-width: var(--measure); }
+h1, h2 { text-wrap: balance; }
+/* A secondary line under a value: a block, never a hard break. */
+.under { display: block; }
+.sub { color: var(--text-3); font-size: var(--fs-small); font-weight: 400; }
+.stack { display: grid; gap: var(--sp-3); align-content: start; min-width: 0; }
+
+/* ---- state vocabulary ---------------------------------------------------- */
+/* Every state is carried by its word and by the shape of its glyph, never by
+   color alone: ok is a filled disc, attention a triangle, failure a diamond, idle
+   a hollow ring, work in progress a pulsing disc. A glyph is .dot, a .badge, a
+   .semantic-state or a .status word. */
+.dot, .badge::before, .semantic-state::before, .status::before { content: ""; display: inline-block; width: 8px; height: 8px; box-sizing: border-box; border: 1.5px solid currentColor;
+  background: var(--glyph-fill, currentColor); clip-path: var(--glyph-clip, circle(50%)); flex: none; }
+.tone-ok, .tone-active { --glyph-clip: circle(50%); --glyph-fill: currentColor; }
+.tone-warn { --glyph-clip: polygon(50% 0, 100% 100%, 0 100%); --glyph-fill: currentColor; }
+.tone-bad { --glyph-clip: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); --glyph-fill: currentColor; }
+.tone-idle { --glyph-clip: circle(50%); --glyph-fill: transparent; }
+.dot { vertical-align: middle; }
+/* Only work in progress moves; a warning or failure holds still. */
+.tone-active .dot { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.badge { display: inline-flex; align-items: center; gap: .35rem; padding: .125rem var(--sp-2); border-radius: var(--r-pill); font-size: var(--fs-label); font-weight: 650; letter-spacing: .05em;
+  text-transform: uppercase; white-space: nowrap; color: var(--tone, var(--idle)); background: var(--tone-soft, var(--idle-soft)); }
+.badge::before, .semantic-state::before, .status::before { width: 8px; height: 8px; }
+.status { display: inline-flex; align-items: center; gap: .35rem; font-size: var(--fs-label); font-weight: 700; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; color: var(--tone, var(--text)); }
+.state-word { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-figure); font-weight: 700; line-height: 1.15; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; color: var(--tone); }
+.state-word .dot { width: 12px; height: 12px; }
+.state-word.compact { font-size: var(--fs-value); letter-spacing: .06em; }
+.state-word.compact .dot { width: 9px; height: 9px; }
+/* A message colors its text and rule by state; it never fills the surface. */
+.msg { padding: var(--sp-2) var(--sp-3); border-radius: var(--r); border: 1px solid var(--line); overflow-wrap: anywhere; max-width: var(--ws-max); }
+.msg.bad { border-color: var(--bad); color: var(--bad); }
+.msg.ok { border-color: color-mix(in srgb, var(--ok) 55%, var(--line)); }
+.msg.warn { border-color: color-mix(in srgb, var(--warn) 60%, var(--line)); }
+
+/* ---- composition ----------------------------------------------------------
+   .section   a group on the page canvas: a hairline rule, then its content
+   .spec      label/value facts in a stable column grid (technical state)
+   Neither has a fill, radius, shadow or state edge. */
+.section { display: grid; gap: var(--sp-3); align-content: start; min-width: 0; padding-top: var(--sp-4); border-top: 1px solid var(--line); }
+.spec { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--col-min)), 1fr)); gap: var(--sp-3) var(--sp-6); margin: 0; }
+.spec > div { min-width: 0; }
+.spec dt { font-size: var(--fs-label); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); }
+.spec dd { margin: .1rem 0 0; font-weight: 560; overflow-wrap: break-word; }
+.spec dd .sub { display: block; font-weight: 400; }
+/* .intent    the operator's decisions in one aligned column: an uppercase
+              label, then the value and its one-line consequence; rows are
+              separated by hairlines. A workspace has one, above its one
+              dominant action. */
+.intent { display: grid; grid-template-columns: minmax(8rem, 13rem) minmax(0, 1fr); margin: 0; max-width: var(--ws-max); }
+.intent > div { display: contents; }
+.intent dt { padding: var(--sp-3) var(--sp-4) var(--sp-3) 0; border-top: 1px solid var(--line); font-size: var(--fs-label); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); }
+.intent dd { display: grid; gap: var(--sp-1); align-content: start; min-width: 0; margin: 0; padding: var(--sp-3) 0; border-top: 1px solid var(--line); }
+.intent dd > .value { font-size: var(--fs-value); font-weight: 600; overflow-wrap: break-word; }
+.intent dd > .value.tone-ok, .intent dd > .value.tone-warn, .intent dd > .value.tone-bad { color: var(--tone); }
+.intent-action { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); padding-top: var(--sp-4); border-top: 1px solid var(--line); }
+@media (max-width: 40rem) { .intent { grid-template-columns: minmax(0, 1fr); } .intent dd { border-top: 0; padding-top: 0; } }
+
+/* ---- controls ------------------------------------------------------------- */
+/* Actions. A secondary action is the plain .btn; the one primary action of a
+   region is .primary; a destructive action is .danger, whose outline and red
+   text are the same everywhere (it is never a bare colored word, even when
+   .quiet drops the other buttons' outline). */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; min-height: var(--ctl-h); padding: .3rem .85rem; border-radius: var(--r); border: 1px solid var(--line-2);
+  background: var(--raised); color: var(--text); font: inherit; font-size: var(--fs-body); font-weight: 560; line-height: 1.3; text-decoration: none; cursor: pointer; white-space: nowrap;
+  transition: background var(--dur-fast), border-color var(--dur-fast); }
+.btn:hover:not(:disabled) { border-color: var(--text-3); }
+.btn:active:not(:disabled) { background: var(--inset); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 86%, var(--text)); }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--text-2); }
+.btn.quiet:hover:not(:disabled) { background: var(--raised); color: var(--text); border-color: transparent; }
+.btn.danger, .btn.danger.quiet { background: transparent; color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line-2)); }
+.btn.danger:hover:not(:disabled), .btn.danger.quiet:hover:not(:disabled) { background: var(--bad-soft); color: var(--bad); border-color: var(--bad); }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
+/* Pending: the submitted control shows that its action is working until the
+   response replaces the page. */
+.btn[aria-busy="true"] { cursor: progress; }
+.btn[aria-busy="true"]::after { content: ""; width: .7em; height: .7em; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.btn-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+
+/* Entry controls share one box: the same height, radius, border, padding and
+   type, in one family of states. Structure, not a box size, tells them apart:
+   a .field holds one control and fills the width of its cell; .fields lays
+   several out in a grid; a numeric entry is as wide as its digits; a textarea
+   is the long-form entry; a .rows list holds repeatable options. */
+input, textarea, select { width: 100%; min-width: 0; min-height: var(--ctl-h); padding: .3rem .55rem; border-radius: var(--r); border: 1px solid var(--line-2); background: var(--inset);
+  color: var(--text); font: inherit; font-size: var(--fs-body); transition: border-color var(--dur-fast); }
+input[spellcheck="false"], textarea { font-family: var(--mono); font-size: var(--fs-code); }
+textarea { resize: vertical; line-height: 1.5; }
+input[type="number"], input[inputmode="decimal"], input[inputmode="numeric"] { width: 12ch; max-width: 100%; text-align: right; font-variant-numeric: tabular-nums; }
+/* A selection reads as one even when closed: a raised face and a pointer, with the
+   native arrow and the native keyboard and list behavior left in place. */
+select { background: var(--raised); cursor: pointer; padding-right: 1.75rem; text-overflow: ellipsis; }
+input:hover:not(:disabled):not([readonly]), textarea:hover:not(:disabled):not([readonly]), select:hover:not(:disabled) { border-color: var(--text-3); }
+input:focus-visible, textarea:focus-visible, select:focus-visible { outline: var(--focus); outline-offset: 0; border-color: var(--accent); box-shadow: var(--focus-ring); }
+input::placeholder, textarea::placeholder { color: var(--text-3); opacity: 1; }
+/* Read-only is a value you can select and copy but not change: a flat face and a
+   dashed border. Disabled is unavailable: faded, with a not-allowed pointer. */
+input[readonly], textarea[readonly] { background: var(--surface); color: var(--text-2); border-style: dashed; }
+input:disabled, textarea:disabled, select:disabled { background: var(--surface); color: var(--text-3); opacity: .6; cursor: not-allowed; }
+/* Invalid: a red border and a double rule, with the reason in a .field-error
+   beside the control (a mark and words, not color alone). */
+input[aria-invalid="true"], textarea[aria-invalid="true"], select[aria-invalid="true"] { border-color: var(--bad); border-style: double; border-width: 3px; padding-block: calc(.3rem - 2px); padding-inline: calc(.55rem - 2px); }
+.field-error { color: var(--bad); font-size: var(--fs-small); font-weight: 500; }
+.field-error::before { content: "\2715\00a0"; }
+.field { display: grid; gap: var(--sp-1); font-size: var(--fs-small); font-weight: 500; color: var(--text-2); min-width: 0; }
+/* An optional field says so in words, quietly. */
+.optional { font-weight: 400; color: var(--text-3); }
+.fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: var(--sp-3); align-items: end; }
+.fields .wide { grid-column: 1 / -1; }
+/* Repeatable options: one structured grid whose header names the columns and
+   whose rows are divided by hairlines; the controls inside sit flat in it. */
+.rows { display: grid; grid-template-columns: minmax(8rem, 1fr) minmax(0, 2fr); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+.rows > .h { padding: var(--sp-2) var(--sp-3); background: var(--raised); border-bottom: 1px solid var(--line); }
+.rows > input { border-color: transparent; border-radius: 0; border-bottom-color: var(--line); background: var(--inset); }
+.rows > input:last-child, .rows > input:nth-last-child(2) { border-bottom-color: transparent; }
+.rows > :nth-child(odd) { border-right: 1px solid var(--line); }
+.rows > input:focus-visible { border-color: var(--accent); position: relative; }
+.h.optional { font-weight: 400; }
+.h { font-size: var(--fs-label); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); }
+label.check { display: flex; align-items: center; gap: var(--sp-2); color: var(--text); cursor: pointer; }
+input[type="checkbox"], input[type="radio"] { width: 1rem; height: 1rem; min-height: 0; margin: 0; padding: 0; accent-color: var(--accent); flex: none; cursor: pointer; }
+input[type="checkbox"]:disabled, input[type="radio"]:disabled, label.check:has(:disabled) { cursor: not-allowed; }
+fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+legend { padding: 0; font-size: var(--fs-small); font-weight: 500; color: var(--text-2); }
+pre { margin: 0; padding: var(--sp-3); background: var(--inset); border: 1px solid var(--line); border-radius: var(--r); overflow: auto; max-height: 22rem; white-space: pre-wrap;
+  overflow-wrap: anywhere; line-height: 1.5; font-size: var(--fs-code); }
+
+/* ---- operator preferences -------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+/* Windows contrast themes: system colors replace the palette, so state that
+   was carried only by fills or shadows gets a border or outline instead. */
+@media (forced-colors: active) {
+  :focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
+  .badge, .msg, .btn { border: 1px solid CanvasText; }
+  input[readonly], textarea[readonly] { border-style: dashed; }
+  .section { border-top-color: CanvasText; }
+  .btn.primary { border-color: Highlight; }
+  .dot, .badge::before, .semantic-state::before, .status::before { background: CanvasText; forced-color-adjust: none; }
+  [aria-current] { outline: 2px solid Highlight; outline-offset: -2px; }
+}

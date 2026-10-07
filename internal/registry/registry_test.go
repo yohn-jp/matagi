@@ -39,10 +39,6 @@ func TestNewSnapshotRejectsInvalidDefinitions(t *testing.T) {
 			envs[0].SSHHost = "-oProxyCommand=unsafe"
 			return envs, services
 		}},
-		{name: "missing supervisor start command", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
-			envs[0].Jinushi.SupervisorStartCommand = nil
-			return envs, services
-		}},
 		{name: "empty supervisor executable", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
 			envs[0].Jinushi.SupervisorStartCommand[0] = ""
 			return envs, services

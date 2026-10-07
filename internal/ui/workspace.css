@@ -1,0 +1,17 @@
+/* Matagi layout compositions over the Hachidori-derived visual system. */
+.shell { max-width: var(--ws-max); margin: auto; padding: var(--sp-5); }
+.mast { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); padding-bottom: var(--sp-4); }
+.flow { display: grid; gap: var(--sp-5); }
+.line { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap; }
+.detail { display: flex; gap: var(--sp-4); flex-wrap: wrap; align-items: center; }
+.service-row { padding: var(--sp-3) 0; border-top: 1px solid var(--line); display: grid; gap: var(--sp-2); }
+.setup { max-width: 40rem; display: grid; gap: var(--sp-4); }
+.endpoints { display: grid; gap: var(--sp-2); }
+.inline { display: inline; }
+.feedback { margin: var(--sp-3) 0; }
+details { padding: var(--sp-2) 0; }
+summary { cursor: pointer; color: var(--text-2); }
+@media (max-width: 40rem) {
+  .shell { padding: var(--sp-4); }
+  .mast { flex-wrap: wrap; }
+}

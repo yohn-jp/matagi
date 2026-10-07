@@ -55,6 +55,7 @@ const (
 	colorWindow        = 5
 	wmDestroy          = 0x0002
 	wmSize             = 0x0005
+	wmDPIChanged       = 0x02E0
 	wmClose            = 0x0010
 	windowClass        = "MatagiWebView2Window"
 )
@@ -204,6 +205,9 @@ func (native) Open(ctx context.Context, w Window) error {
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	if err := enablePerMonitorDPI(); err != nil {
+		return fmt.Errorf("enabling per-monitor DPI awareness: %w", err)
+	}
 	switch err := windows.CoInitializeEx(0, windows.COINIT_APARTMENTTHREADED); {
 	case err == nil, errors.Is(err, syscall.Errno(1)):
 		defer windows.CoUninitialize()
@@ -271,7 +275,8 @@ func (native) Open(ctx context.Context, w Window) error {
 
 	hwnd, _, callErr := procCreateWindowExW.Call(0,
 		uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(titlePtr)),
-		wsOverlappedWindow, cwUseDefault, cwUseDefault, 1100, 780,
+		wsOverlappedWindow, cwUseDefault, cwUseDefault,
+		uintptr(scaleForDPI(1100, systemDPI())), uintptr(scaleForDPI(780, systemDPI())),
 		0, 0, uintptr(instance), 0)
 	if hwnd == 0 {
 		return fmt.Errorf("creating the Matagi window: %w", callErr)
@@ -377,6 +382,12 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 	activeShellMu.Unlock()
 	if s != nil {
 		switch uint32(message) {
+		case wmDPIChanged:
+			applyDPIChange(hwnd, lParam)
+			if s.chromium != nil {
+				s.chromium.Resize()
+			}
+			return 0
 		case wmSize:
 			if s.chromium != nil {
 				s.chromium.Resize()

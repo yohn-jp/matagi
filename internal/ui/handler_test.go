@@ -29,8 +29,8 @@ func TestHandlerRendersContractStateWithoutUnknownRuntimeData(t *testing.T) {
 	}
 	body := response.Body.String()
 	for _, want := range []string{
-		"Environment dev", "Connectivity: connected", "environment error", "Desired", "running",
-		"process warning", "readiness warning", "Dashboard", "Endpoint: available", "Tunnel: ready", "Local: available",
+		"dev", "Connection · SSH", "environment error", "Jinushi · supervisor", "running", "tone-ok", "prefers-color-scheme: light", "aria-busy", "live · 3 s", "setInterval(refresh,3000)", "Start", "Restart", "Stop",
+		"process warning", "readiness warning", "Dashboard", "available", "Tunnel: ready", "Open",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page lacks %q", want)
@@ -53,7 +53,7 @@ func TestEmptyStateRegistrationSurfaceAndSubmission(t *testing.T) {
 			fmt.Fprint(w, `{"version":1,"environments":[]}`)
 			return
 		}
-		if r.URL.Path != "/v1/environment/register" {
+		if r.URL.Path != "/v1/environment/connect" {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 		requests++
@@ -62,18 +62,14 @@ func TestEmptyStateRegistrationSurfaceAndSubmission(t *testing.T) {
 	defer server.Close()
 	client, _ := NewClient(server.URL, time.Second)
 	h := NewHandler(client, nil)
+	token := h.(*handler).token
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
-	if !strings.Contains(w.Body.String(), "Add development environment") {
-		t.Fatal(w.Body.String())
+	if !strings.Contains(w.Body.String(), "Connect a development environment") || strings.Contains(w.Body.String(), "registry JSON") || strings.Contains(w.Body.String(), "<textarea") {
+		t.Fatal("onboarding surface exposes registry schema")
 	}
 	w = httptest.NewRecorder()
-	h.ServeHTTP(w, formRequest("POST", "/register", url.Values{"configuration": {`{broken`}}))
-	if requests != 0 || w.Code != 400 {
-		t.Fatal(w.Code, requests)
-	}
-	w = httptest.NewRecorder()
-	h.ServeHTTP(w, formRequest("POST", "/register", url.Values{"configuration": {`{"environments":[],"services":[]}`}}))
+	h.ServeHTTP(w, formRequest("POST", "/register", url.Values{"name": {"dev"}, "host": {"dev-host"}}, token))
 	if requests != 1 || w.Code != 303 {
 		t.Fatal(w.Code, requests)
 	}
@@ -100,7 +96,8 @@ func TestHandlerLifecycleActionsSendOneMatchingRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(client, nil)
+	h := NewHandler(client, nil)
+	token := h.(*handler).token
 	for _, action := range []string{"start", "stop", "restart"} {
 		form := url.Values{
 			"environmentId": {"dev"},
@@ -108,7 +105,7 @@ func TestHandlerLifecycleActionsSendOneMatchingRequest(t *testing.T) {
 			"action":        {action},
 		}
 		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, formRequest(http.MethodPost, "/action", form))
+		h.ServeHTTP(response, formRequest(http.MethodPost, "/action", form, token))
 		if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/" {
 			t.Fatalf("%s status = %d, location %q, body %s", action, response.Code, response.Header().Get("Location"), response.Body.String())
 		}
@@ -161,14 +158,15 @@ func TestHandlerEnsuresBeforeAdmittingAndRedirectingEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	admitter := &testAdmitter{ensured: &ensured}
-	handler := NewHandler(client, admitter)
+	h := NewHandler(client, admitter)
+	token := h.(*handler).token
 	form := url.Values{
 		"environmentId": {"dev"},
 		"serviceId":     {"svc"},
 		"endpointId":    {"dash"},
 	}
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, formRequest(http.MethodPost, "/open", form))
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/open", form, token))
 	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != endpointURL {
 		t.Fatalf("status = %d, location %q, body %s", response.Code, response.Header().Get("Location"), response.Body.String())
 	}
@@ -198,10 +196,11 @@ func TestHandlerDoesNotOpenUnavailableOrUnadmittedEndpoint(t *testing.T) {
 				t.Fatal(err)
 			}
 			admitter := &testAdmitter{err: test.admitterErr}
-			handler := NewHandler(client, admitter)
+			h := NewHandler(client, admitter)
+			token := h.(*handler).token
 			form := url.Values{"environmentId": {"dev"}, "serviceId": {"svc"}, "endpointId": {"dash"}}
 			response := httptest.NewRecorder()
-			handler.ServeHTTP(response, formRequest(http.MethodPost, "/open", form))
+			h.ServeHTTP(response, formRequest(http.MethodPost, "/open", form, token))
 			if response.Code == http.StatusSeeOther {
 				t.Fatalf("unexpected redirect to %q", response.Header().Get("Location"))
 			}
@@ -212,8 +211,39 @@ func TestHandlerDoesNotOpenUnavailableOrUnadmittedEndpoint(t *testing.T) {
 	}
 }
 
-func formRequest(method, target string, form url.Values) *http.Request {
-	request := httptest.NewRequest(method, target, strings.NewReader(form.Encode()))
+func TestStateChangingFormsRequireTokenAndErrorPagesKeepSecurityHeaders(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "upstream failed", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	client, _ := NewClient(server.URL, time.Second)
+	h := NewHandler(client, nil)
+
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/register", url.Values{"name": {"dev"}, "host": {"host"}}, "wrong"))
+	if response.Code != http.StatusForbidden || calls != 0 {
+		t.Fatalf("invalid token gate: status=%d calls=%d", response.Code, calls)
+	}
+	if response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("rejected form headers = %#v", response.Header())
+	}
+
+	response = httptest.NewRecorder()
+	h.(*handler).showError(response, http.StatusBadGateway, "failure")
+	if response.Code != http.StatusBadGateway || response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("error response headers = %#v", response.Header())
+	}
+}
+
+func formRequest(method, target string, form url.Values, token string) *http.Request {
+	values := make(url.Values, len(form)+1)
+	for key, items := range form {
+		values[key] = append([]string(nil), items...)
+	}
+	values.Set("token", token)
+	request := httptest.NewRequest(method, target, strings.NewReader(values.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return request
 }

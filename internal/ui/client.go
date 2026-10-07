@@ -80,6 +80,7 @@ type State struct {
 
 type Environment struct {
 	ID           string    `json:"id"`
+	SSHHost      string    `json:"sshHost"`
 	Connectivity string    `json:"connectivity"`
 	Jinushi      string    `json:"jinushi"`
 	Error        string    `json:"error"`
@@ -178,6 +179,29 @@ func (c *Client) EnsureJinushi(ctx context.Context, environmentID string) error 
 		return errors.New("invalid Jinushi response")
 	}
 	return nil
+}
+
+type ConnectRequest struct {
+	ID        string   `json:"id"`
+	SSHHost   string   `json:"sshHost"`
+	Bootstrap []string `json:"bootstrap,omitempty"`
+}
+type AddServiceRequest struct {
+	EnvironmentID string   `json:"environmentId"`
+	ID            string   `json:"id"`
+	Argv          []string `json:"argv"`
+	CWD           string   `json:"cwd"`
+	Port          int      `json:"port"`
+	HealthPath    string   `json:"healthPath"`
+}
+
+func (c *Client) Connect(ctx context.Context, req ConnectRequest) error {
+	var state State
+	return c.post(ctx, "/v1/environment/connect", req, &state)
+}
+func (c *Client) AddService(ctx context.Context, req AddServiceRequest) error {
+	var state State
+	return c.post(ctx, "/v1/service/add", req, &state)
 }
 
 func (c *Client) Register(ctx context.Context, document json.RawMessage) error {

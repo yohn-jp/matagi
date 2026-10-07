@@ -93,6 +93,7 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 func postAction(t *testing.T, uiURL, action string) {
 	t.Helper()
 	form := url.Values{
+		"token":         {formToken(t, uiURL)},
 		"action":        {action},
 		"environmentId": {"fixture-env"},
 		"serviceId":     {"fixture-service"},
@@ -117,6 +118,7 @@ func postAction(t *testing.T, uiURL, action string) {
 func openEndpoint(t *testing.T, uiURL string) string {
 	t.Helper()
 	form := url.Values{
+		"token":         {formToken(t, uiURL)},
 		"environmentId": {"fixture-env"},
 		"serviceId":     {"fixture-service"},
 		"endpointId":    {"ui"},
@@ -141,6 +143,26 @@ func openEndpoint(t *testing.T, uiURL string) string {
 		t.Fatalf("non-loopback ensured endpoint %q", location)
 	}
 	return strings.TrimRight(location, "/")
+}
+
+func formToken(t *testing.T, uiURL string) string {
+	t.Helper()
+	body := harness.Get(t, uiURL+"/")
+	const marker = `name="token" value="`
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Fatal("candidate page did not contain form token")
+	}
+	start += len(marker)
+	end := strings.IndexByte(body[start:], '"')
+	if end < 0 {
+		t.Fatal("candidate page contained malformed form token")
+	}
+	token := body[start : start+end]
+	if len(token) != 32 {
+		t.Fatalf("unexpected form token length %d", len(token))
+	}
+	return token
 }
 
 func startRemoteHTTP(t *testing.T) int {

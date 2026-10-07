@@ -2,10 +2,15 @@ package ui
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/rand"
+	"crypto/subtle"
+	_ "embed"
+	"encoding/hex"
 	"errors"
 	"html/template"
 	"net/http"
+	"strconv"
+	"strings"
 )
 
 const maxFormBytes = 16 << 10
@@ -19,21 +24,46 @@ type EndpointAdmitter interface {
 type page struct {
 	State *State
 	Error string
+	Token string
 }
 
 // NewHandler serves Matagi's local HTML surface. It talks to the runtime only
 // through Client and delegates endpoint navigation admission to the desktop
 // shell after a successful ensure response.
 func NewHandler(client *Client, admitter EndpointAdmitter) http.Handler {
-	return &handler{client: client, admitter: admitter}
+	return &handler{client: client, admitter: admitter, token: newFormToken()}
 }
 
 type handler struct {
 	client   *Client
 	admitter EndpointAdmitter
+	token    string
+}
+
+func newFormToken() string {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(value)
+}
+
+func (h *handler) validFormToken(value string) bool {
+	return len(value) == len(h.token) && subtle.ConstantTimeCompare([]byte(value), []byte(h.token)) == 1
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	if r.Method == http.MethodPost {
+		if err := parseForm(w, r); err != nil {
+			http.Error(w, "invalid form submission", http.StatusBadRequest)
+			return
+		}
+		if !h.validFormToken(r.PostForm.Get("token")) {
+			http.Error(w, "invalid form token", http.StatusForbidden)
+			return
+		}
+	}
 	switch r.URL.Path {
 	case "/":
 		if r.Method != http.MethodGet {
@@ -46,7 +76,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, http.MethodPost)
 			return
 		}
-		if err := parseForm(w, r); err != nil || r.PostForm.Get("environmentId") == "" {
+		if r.PostForm.Get("environmentId") == "" {
 			http.Error(w, "invalid environment", http.StatusBadRequest)
 			return
 		}
@@ -55,6 +85,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Redirect(w, r, "/", http.StatusSeeOther)
+	case "/service/add":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.addService(w, r)
 	case "/register":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -101,31 +137,61 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request, message string) 
 			}
 		}
 	}
-	h.render(w, page{State: &state, Error: message})
+	h.render(w, page{State: &state, Error: message, Token: h.token})
 }
 
 func (h *handler) register(w http.ResponseWriter, r *http.Request) {
-	if err := parseForm(w, r); err != nil {
-		http.Error(w, "invalid registration", http.StatusBadRequest)
-		return
+	request := ConnectRequest{ID: strings.TrimSpace(r.PostForm.Get("name")), SSHHost: strings.TrimSpace(r.PostForm.Get("host"))}
+	if cmd := strings.TrimSpace(r.PostForm.Get("bootstrap")); cmd != "" {
+		request.Bootstrap = strings.Fields(cmd)
 	}
-	input := []byte(r.PostForm.Get("configuration"))
-	if !json.Valid(input) {
-		h.showError(w, http.StatusBadRequest, "Enter a valid registry JSON document.")
-		return
-	}
-	if err := h.client.Register(r.Context(), json.RawMessage(input)); err != nil {
-		h.showError(w, apiStatus(err), bounded(err.Error(), maxErrorMessage))
+	if err := h.client.Connect(r.Context(), request); err != nil {
+		h.index(w, r, describeFailure(err))
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func (h *handler) action(w http.ResponseWriter, r *http.Request) {
-	if err := parseForm(w, r); err != nil {
-		http.Error(w, "invalid action request", http.StatusBadRequest)
+func (h *handler) addService(w http.ResponseWriter, r *http.Request) {
+	port, err := strconv.Atoi(r.PostForm.Get("port"))
+	if err != nil {
+		h.index(w, r, "Enter a valid UI port (1–65535).")
 		return
 	}
+	req := AddServiceRequest{EnvironmentID: r.PostForm.Get("environmentId"), ID: strings.TrimSpace(r.PostForm.Get("service")), Argv: strings.Fields(r.PostForm.Get("command")), CWD: strings.TrimSpace(r.PostForm.Get("cwd")), Port: port, HealthPath: strings.TrimSpace(r.PostForm.Get("healthPath"))}
+	if err := h.client.AddService(r.Context(), req); err != nil {
+		h.index(w, r, describeFailure(err))
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func describeFailure(err error) string {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case "invalid-request":
+			return "Check the entered details and try again. No changes were saved."
+		case "ssh-transport-failed", "host-unreachable":
+			return "SSH transport or authentication failed. Check your OpenSSH host alias and credentials."
+		case "ssh-timeout":
+			return "SSH host did not respond before the connection timed out."
+		case "ssh-connectivity-failed":
+			return "SSH connected, but the remote connectivity check failed."
+		case "jinushi-unavailable":
+			return "Jinushi is unavailable. Check that it is installed, or specify its bootstrap command under Advanced."
+		case "jinushi-bootstrap-failed":
+			return "Jinushi bootstrap failed. Check the configured command on the development host."
+		case "jinushi-readiness-timeout", "jinushi-readiness-failed":
+			return "Jinushi did not become ready. Check its status on the development host."
+		case "lifecycle-conflict":
+			return "This environment or service is already registered. Refresh the workspace."
+		}
+	}
+	return bounded(err.Error(), maxErrorMessage)
+}
+
+func (h *handler) action(w http.ResponseWriter, r *http.Request) {
 	envID, serviceID, action := r.PostForm.Get("environmentId"), r.PostForm.Get("serviceId"), r.PostForm.Get("action")
 	if envID == "" || serviceID == "" {
 		http.Error(w, "environment and service are required", http.StatusBadRequest)
@@ -152,10 +218,6 @@ func (h *handler) action(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) open(w http.ResponseWriter, r *http.Request) {
-	if err := parseForm(w, r); err != nil {
-		http.Error(w, "invalid endpoint request", http.StatusBadRequest)
-		return
-	}
 	request := EndpointRequest{
 		EnvironmentID: r.PostForm.Get("environmentId"),
 		ServiceID:     r.PostForm.Get("serviceId"),
@@ -197,8 +259,7 @@ func (h *handler) open(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) showError(w http.ResponseWriter, status int, message string) {
-	w.WriteHeader(status)
-	h.render(w, page{Error: bounded(message, maxErrorMessage)})
+	h.renderStatus(w, status, page{Error: bounded(message, maxErrorMessage), Token: h.token})
 }
 
 func apiStatus(err error) int {
@@ -229,10 +290,19 @@ func methodNotAllowed(w http.ResponseWriter, allowed string) {
 }
 
 func (h *handler) render(w http.ResponseWriter, data page) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	h.renderStatus(w, http.StatusOK, data)
+}
+
+func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 	w.Header().Set("Cache-Control", "no-store")
+}
+
+func (h *handler) renderStatus(w http.ResponseWriter, status int, data page) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
 	if err := pageTemplate.Execute(w, data); err != nil {
 		return
 	}
@@ -248,72 +318,21 @@ func localAvailabilityURL(endpoint *Endpoint) string {
 	return "available"
 }
 
-var pageTemplate = template.Must(template.New("matagi").Parse(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Matagi</title>
-<style>
-:root { color-scheme: light dark; font: 16px system-ui, sans-serif; }
-body { margin: 0 auto; max-width: 72rem; padding: 1.5rem; }
-h1 { margin-top: 0; }
-section.environment { border-top: 1px solid #8886; margin-top: 1.5rem; padding-top: 1rem; }
-article.service { border: 1px solid #8886; border-radius: .5rem; margin: 1rem 0; padding: 1rem; }
-.facts { display: grid; gap: .4rem 1rem; grid-template-columns: max-content 1fr; }
-.error { color: #b42318; }
-form { display: inline-block; margin: .3rem .4rem .3rem 0; }
-button { cursor: pointer; padding: .45rem .8rem; }
-</style>
-</head>
-<body>
-<main>
-<h1>Matagi</h1>
-{{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
-{{if .State}}
-{{range .State.Environments}}
-<section class="environment">
-{{ $environmentID := .ID }}
-<h2>Environment {{.ID}}</h2>
-<p>Connectivity: {{.Connectivity}}</p>
-<p>Jinushi: {{.Jinushi}}</p>
-{{if not .Services}}<p>No services registered. Paste a complete document with the same environment and Inari/Yokodori definitions to finish setup.</p>
-<form method="post" action="/register"><label for="configuration">Add Inari and Yokodori (registry JSON)</label><br><textarea id="configuration" name="configuration" rows="16" cols="80" required></textarea><br><button type="submit">Register services</button></form>{{end}}
-<form method="post" action="/jinushi"><input type="hidden" name="environmentId" value="{{.ID}}"><button type="submit">Check / start Jinushi</button></form>
-{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-{{range .Services}}
-<article class="service">
-{{ $serviceID := .ID }}
-<h3>{{.ID}}</h3>
-<div class="facts">
-<span>Desired</span><span>{{.DesiredState}}</span>
-<span>Service</span><span>{{.State}}</span>
-<span>Process</span><span>{{.Process}}</span>
-<span>Readiness</span><span>{{.Readiness}}</span>
-</div>
-{{if .ProcessError}}<p class="error">Process: {{.ProcessError}}</p>{{end}}
-{{if .ReadinessError}}<p class="error">Readiness: {{.ReadinessError}}</p>{{end}}
-<form method="post" action="/action"><input type="hidden" name="environmentId" value="{{$environmentID}}"><input type="hidden" name="serviceId" value="{{$serviceID}}"><button name="action" value="start">Start</button></form>
-<form method="post" action="/action"><input type="hidden" name="environmentId" value="{{$environmentID}}"><input type="hidden" name="serviceId" value="{{$serviceID}}"><button name="action" value="stop">Stop</button></form>
-<form method="post" action="/action"><input type="hidden" name="environmentId" value="{{$environmentID}}"><input type="hidden" name="serviceId" value="{{$serviceID}}"><button name="action" value="restart">Restart</button></form>
-{{range .Endpoints}}
-<section class="endpoint">
-<h4>{{.Label}}</h4>
-<p>Endpoint: {{.EndpointState}} · Tunnel: {{.TunnelState}} · Local: {{if .LocalURL}}{{.LocalURL}}{{else}}unavailable{{end}}</p>
-{{if .Failure}}<p class="error">{{.Failure}}</p>{{end}}
-<form method="post" action="/open"><input type="hidden" name="environmentId" value="{{$environmentID}}"><input type="hidden" name="serviceId" value="{{$serviceID}}"><input type="hidden" name="endpointId" value="{{.ID}}"><button type="submit">Open</button></form>
-</section>
-{{end}}
-</article>
-{{end}}
-</section>
-{{else}}
-<p>No environments are registered. Add a development environment using a registry document. See docs/getting-started.md for a complete Inari and Yokodori example. SSH authentication remains in your system OpenSSH configuration.</p>
-<form method="post" action="/register"><label for="configuration">Add development environment (registry JSON)</label><br><textarea id="configuration" name="configuration" rows="16" cols="80" required>{"environments":[{"id":"development","sshHost":"development","jinushi":{"supervisorStartCommand":["systemctl","--user","start","jinushi"]}}],"services":[]}</textarea><br><button type="submit">Add development environment</button></form>
-{{end}}
-{{else}}
-<p>Waiting for the Matagi service API.</p>
-{{end}}
-</main>
-</body>
-</html>`))
+//go:embed page.html
+var pageHTML string
+
+var pageTemplate = template.Must(template.New("matagi").Funcs(template.FuncMap{
+	"systemCSS": CSS,
+	"tone": func(state string) string {
+		switch state {
+		case "ready", "running", "connected", "available":
+			return "tone-ok"
+		case "starting", "ensuring":
+			return "tone-active"
+		case "unhealthy", "unreachable", "unavailable", "error", "failed":
+			return "tone-bad"
+		default:
+			return "tone-idle"
+		}
+	},
+}).Parse(pageHTML))
