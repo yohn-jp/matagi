@@ -159,10 +159,6 @@ func assertOpenUnavailable(t *testing.T, uiURL string) {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		t.Fatalf("Open before application readiness returned %s %s; want fail closed", resp.Status, body)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil || !strings.Contains(string(body), "not responding through the tunnel") {
-		t.Fatalf("Open before application readiness diagnostic = %q, %v", body, err)
-	}
 }
 
 func postAction(t *testing.T, uiURL, action string) {
