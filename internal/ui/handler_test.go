@@ -106,15 +106,17 @@ func TestEmptyStateRegistrationSurfaceAndSubmission(t *testing.T) {
 }
 
 func TestGenericServiceFormAndBoundedArgvRegistration(t *testing.T) {
-	var registered AddServiceRequest
+	var registered []AddServiceRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/state":
 			fmt.Fprint(w, `{"version":1,"environments":[{"id":"dev","connectivity":"connected","jinushi":"ready","services":[]}]}`)
 		case "/v1/service/add":
-			if err := json.NewDecoder(r.Body).Decode(&registered); err != nil {
+			var request AddServiceRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Errorf("decode service registration: %v", err)
 			}
+			registered = append(registered, request)
 			fmt.Fprint(w, `{"version":1,"environments":[]}`)
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -130,7 +132,7 @@ func TestGenericServiceFormAndBoundedArgvRegistration(t *testing.T) {
 	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.String()
 	for _, want := range []string{
-		"Service name", "Remote UI port", "Readiness path", "Working directory on the development host", "Start command and arguments", "Matagi does not parse shell quoting.",
+		"Service name", "Remote UI port (static endpoint)", "Dynamic endpoint descriptor path (optional)", "managed Run output", "Readiness path", "Working directory on the development host", "Start command and arguments", "Matagi does not parse shell quoting.",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("generic service form lacks %q", want)
@@ -155,8 +157,23 @@ func TestGenericServiceFormAndBoundedArgvRegistration(t *testing.T) {
 		t.Fatalf("service registration = %d, body=%s", response.Code, response.Body.String())
 	}
 	want := AddServiceRequest{EnvironmentID: "dev", ID: "local-dashboard", Argv: []string{"python", "-m", "http.server", "8080"}, CWD: "/srv/dashboard", Port: 43123, HealthPath: "/healthz"}
-	if registered.EnvironmentID != want.EnvironmentID || registered.ID != want.ID || registered.CWD != want.CWD || registered.Port != want.Port || registered.HealthPath != want.HealthPath || strings.Join(registered.Argv, "\x00") != strings.Join(want.Argv, "\x00") {
+	if len(registered) != 1 || registered[0].EnvironmentID != want.EnvironmentID || registered[0].ID != want.ID || registered[0].CWD != want.CWD || registered[0].Port != want.Port || registered[0].HealthPath != want.HealthPath || strings.Join(registered[0].Argv, "\x00") != strings.Join(want.Argv, "\x00") {
 		t.Fatalf("registered service = %#v, want %#v", registered, want)
+	}
+	dynamicForm := url.Values{
+		"environmentId":  {"dev"},
+		"service":        {"ephemeral-dashboard"},
+		"resolutionPath": {"/home/dev/.cache/service/endpoint.json"},
+		"cwd":            {"/srv/dashboard"},
+		"command":        {"dashboard --serve"},
+	}
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/service/add", dynamicForm, h.token))
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("dynamic service registration = %d, body=%s", response.Code, response.Body.String())
+	}
+	if len(registered) != 2 || registered[1].Port != 0 || registered[1].ResolutionPath != dynamicForm.Get("resolutionPath") {
+		t.Fatalf("dynamic registration request = %#v", registered)
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,8 +31,9 @@ type run struct {
 }
 
 type fixtureState struct {
-	Next int  `json:"next"`
-	Run  *run `json:"run,omitempty"`
+	Next   int    `json:"next"`
+	Run    *run   `json:"run,omitempty"`
+	Stdout string `json:"stdout,omitempty"`
 }
 
 func main() {
@@ -52,6 +54,10 @@ func main() {
 	}
 	command := args[1:]
 	if len(command) == 1 && command[0] == "true" {
+		return
+	}
+	if command[0] == "head" {
+		readEndpointDescriptor(command)
 		return
 	}
 	if command[0] != "jinushi" || len(command) < 2 {
@@ -84,8 +90,15 @@ func main() {
 			CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 			Spec:       runSpec{Correlation: map[string]string{"owner": owner}},
 		}
+		state.Stdout = "Dashboard: " + os.Getenv("MATAGI_E2E_ENDPOINT_URL") + "\n"
 		saveState(statePath, state)
 		emit(map[string]any{"version": 1, "run": state.Run})
+	case "output":
+		requireRun(state)
+		if command[len(command)-1] != state.Run.ID {
+			fail("output requested for a Run other than the managed Run")
+		}
+		emit(map[string]any{"version": 1, "data": base64.StdEncoding.EncodeToString([]byte(state.Stdout))})
 	case "inspect":
 		requireRun(state)
 		emit(map[string]any{"version": 1, "run": state.Run})
@@ -102,6 +115,17 @@ func main() {
 	default:
 		fail("unsupported Jinushi command")
 	}
+}
+
+func readEndpointDescriptor(command []string) {
+	if len(command) < 5 || command[1] != "-c" || command[3] != "--" || command[4] != os.Getenv("MATAGI_E2E_ENDPOINT_PATH") {
+		fail("unexpected endpoint descriptor request")
+	}
+	url := os.Getenv("MATAGI_E2E_ENDPOINT_URL")
+	if url == "" {
+		fail("missing managed endpoint URL")
+	}
+	emit(map[string]any{"url": url})
 }
 
 func logArgs(args []string) {

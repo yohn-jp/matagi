@@ -118,7 +118,8 @@
                 <input type="hidden" name="token" value="{{$.Token}}">
                 <input type="hidden" name="environmentId" value="{{.ID}}">
                 <label class="field">{{t $.Locale "Service name"}}<input name="service" autocomplete="off" required><span class="note">{{t $.Locale "This name identifies the service in Matagi."}}</span></label>
-                <label class="field">{{t $.Locale "Remote UI port"}}<input name="port" type="number" min="1" max="65535" required></label>
+                <label class="field">{{t $.Locale "Remote UI port (static endpoint)"}}<input name="port" type="number" min="1" max="65535"></label>
+                <label class="field">{{t $.Locale "Dynamic endpoint descriptor path (optional)"}}<input name="resolutionPath" spellcheck="false"><span class="note">{{t $.Locale "Use an absolute remote path to a JSON file with a url field. Matagi checks it against the managed Run output."}}</span></label>
                 <label class="field">{{t $.Locale "Readiness path"}} <span class="optional">{{t $.Locale "(optional; defaults to /)"}}</span><input name="healthPath" placeholder="/" spellcheck="false"></label>
                 <label class="field">{{t $.Locale "Working directory on the development host"}}<input name="cwd" spellcheck="false" required></label>
                 <label class="field">{{t $.Locale "Start command and arguments"}}<input name="command" required><span class="note">{{t $.Locale "Separate arguments with spaces. Use a wrapper script when an argument requires quoting; Matagi does not parse shell quoting."}}</span></label>

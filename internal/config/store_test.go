@@ -130,6 +130,34 @@ func TestStoreRoundTripsDeterministically(t *testing.T) {
 	}
 }
 
+func TestStoreRoundTripsDynamicEndpointResolution(t *testing.T) {
+	environments := configFixture(false).Environments()
+	services := configFixture(false).Services()
+	services[0].Endpoints[0].RemotePort = 33031
+	services[0].Endpoints[0].Resolution = &registry.EndpointResolution{
+		Type: registry.EndpointResolutionJSONURLFile,
+		Path: "/home/dev/.cache/service/endpoint.json",
+	}
+	snapshot, err := registry.NewSnapshot(environments, services)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(snapshot); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !reflect.DeepEqual(snapshot.Services(), loaded.Services()) {
+		t.Fatalf("dynamic endpoint changed across reload: before=%#v after=%#v", snapshot.Services(), loaded.Services())
+	}
+}
+
 func TestLoadRejectsCorruptUnsupportedAndSecretFields(t *testing.T) {
 	tests := []struct {
 		name string

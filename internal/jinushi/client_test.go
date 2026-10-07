@@ -2,6 +2,7 @@ package jinushi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -92,6 +93,67 @@ func TestEnsureReadyKeepsUnavailableDistinctWhenBootstrapIsNotConfigured(t *test
 	if len(executor.calls) != 1 {
 		t.Fatalf("commands = %v, want status only", executor.calls)
 	}
+}
+
+func TestReadRunOutputUsesBoundedRunSpecificStdout(t *testing.T) {
+	want := []byte("dashboard: http://127.0.0.1:43123/\n")
+	executor := &fakeExecutor{run: func(_ context.Context, argv []string, _ time.Duration) (CommandResult, error) {
+		if argv[1] != "output" || !containsArg(argv, "--json") || !containsArg(argv, "--stream=stdout") || !containsArg(argv, "--offset=0") || !containsArg(argv, "--limit=65536") || argv[len(argv)-1] != "run-managed" {
+			t.Fatalf("output command = %v", argv)
+		}
+		return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "data": base64.StdEncoding.EncodeToString(want)}), nil
+	}}
+	client := newTestClient(t, executor, Options{CommandTimeout: time.Second, StateDir: "/state"})
+
+	got, err := client.ReadRunOutput(context.Background(), "run-managed")
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("ReadRunOutput() = %q, %v; want %q", got, err, want)
+	}
+	if len(executor.calls) != 1 || !containsArg(executor.calls[0], "--state-dir=/state") {
+		t.Fatalf("output calls = %v", executor.calls)
+	}
+}
+
+func TestReadRunOutputFailsClosedOnGapsAndOutputOverflow(t *testing.T) {
+	t.Run("retention gap", func(t *testing.T) {
+		executor := &fakeExecutor{run: func(_ context.Context, argv []string, _ time.Duration) (CommandResult, error) {
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "data": "", "gap": true, "retainedFrom": 12}), nil
+		}}
+		client := newTestClient(t, executor, Options{CommandTimeout: time.Second})
+		if _, err := client.ReadRunOutput(context.Background(), "run-managed"); err == nil || !strings.Contains(err.Error(), "retention gap") {
+			t.Fatalf("ReadRunOutput() error = %v, want retention gap", err)
+		}
+	})
+
+	t.Run("over limit", func(t *testing.T) {
+		calls := 0
+		executor := &fakeExecutor{run: func(_ context.Context, argv []string, _ time.Duration) (CommandResult, error) {
+			calls++
+			if calls == 1 {
+				return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "data": base64.StdEncoding.EncodeToString(make([]byte, maxRunOutputBytes))}), nil
+			}
+			if !containsArg(argv, "--offset=65536") || !containsArg(argv, "--limit=1") {
+				t.Fatalf("overflow probe command = %v", argv)
+			}
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "data": base64.StdEncoding.EncodeToString([]byte("x"))}), nil
+		}}
+		client := newTestClient(t, executor, Options{CommandTimeout: time.Second})
+		if _, err := client.ReadRunOutput(context.Background(), "run-managed"); err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("ReadRunOutput() error = %v, want output limit failure", err)
+		}
+		if calls != 2 {
+			t.Fatalf("output calls = %d, want bounded overflow probe", calls)
+		}
+	})
+	t.Run("oversized encoded response", func(t *testing.T) {
+		executor := &fakeExecutor{run: func(_ context.Context, _ []string, _ time.Duration) (CommandResult, error) {
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "data": base64.StdEncoding.EncodeToString(make([]byte, 2*maxRunOutputBytes))}), nil
+		}}
+		client := newTestClient(t, executor, Options{CommandTimeout: time.Second})
+		if _, err := client.ReadRunOutput(context.Background(), "run-managed"); err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("ReadRunOutput() error = %v, want encoded output limit failure", err)
+		}
+	})
 }
 
 func TestStartUsesDetachedRunAndStableCorrelation(t *testing.T) {

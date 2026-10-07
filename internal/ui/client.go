@@ -187,12 +187,13 @@ type ConnectRequest struct {
 	Bootstrap []string `json:"bootstrap,omitempty"`
 }
 type AddServiceRequest struct {
-	EnvironmentID string   `json:"environmentId"`
-	ID            string   `json:"id"`
-	Argv          []string `json:"argv"`
-	CWD           string   `json:"cwd"`
-	Port          int      `json:"port"`
-	HealthPath    string   `json:"healthPath"`
+	EnvironmentID  string   `json:"environmentId"`
+	ID             string   `json:"id"`
+	Argv           []string `json:"argv"`
+	CWD            string   `json:"cwd"`
+	Port           int      `json:"port"`
+	ResolutionPath string   `json:"resolutionPath,omitempty"`
+	HealthPath     string   `json:"healthPath"`
 }
 
 func (c *Client) Connect(ctx context.Context, req ConnectRequest) error {

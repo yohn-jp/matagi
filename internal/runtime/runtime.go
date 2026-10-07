@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -122,18 +123,19 @@ type binding struct {
 	control, observe *jinushi.Client
 }
 type Runtime struct {
-	mu         sync.Mutex
-	registry   *registry.Snapshot
-	store      *config.Store
-	ssh        remoteRunner
-	bindings   map[string]binding
-	services   map[string]registry.Service
-	tunnels    *tunnel.Manager
-	observer   *health.Observer
-	pending    map[string]string
-	jinushi    map[string]string
-	closed     bool
-	httpClient *http.Client
+	mu               sync.Mutex
+	registry         *registry.Snapshot
+	store            *config.Store
+	ssh              remoteRunner
+	bindings         map[string]binding
+	services         map[string]registry.Service
+	tunnels          *tunnel.Manager
+	observer         *health.Observer
+	pending          map[string]string
+	jinushi          map[string]string
+	endpointFailures map[tunnel.Identity]string
+	closed           bool
+	httpClient       *http.Client
 }
 
 func key(env, service string) string { return env + "\x00" + service }
@@ -178,7 +180,7 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 	if snapshot == nil || client == nil || manager == nil {
 		return nil, errors.New("registry, SSH client and tunnel manager are required")
 	}
-	r := &Runtime{ssh: client, tunnels: manager, pending: map[string]string{}, jinushi: map[string]string{}, httpClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	r := &Runtime{ssh: client, tunnels: manager, pending: map[string]string{}, jinushi: map[string]string{}, endpointFailures: map[tunnel.Identity]string{}, httpClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	if err := r.configure(snapshot); err != nil {
 		return nil, err
 	}
@@ -188,6 +190,9 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 func (r *Runtime) configure(snapshot *registry.Snapshot) error {
 	r.registry = snapshot
 	r.jinushi = map[string]string{}
+	if r.endpointFailures == nil {
+		r.endpointFailures = map[tunnel.Identity]string{}
+	}
 	r.bindings = map[string]binding{}
 	r.services = map[string]registry.Service{}
 	client := r.ssh
@@ -316,53 +321,6 @@ func (r *Runtime) Stop(ctx context.Context, env, id string) (Service, error) {
 func (r *Runtime) Restart(ctx context.Context, env, id string) (Service, error) {
 	return r.mutate(ctx, env, id, "restart")
 }
-
-// updateDesiredState persists and publishes one lifecycle intent while the
-// runtime mutex is held. The observer is left intact because its probe targets
-// and runtime observations do not change when desired state changes.
-func (r *Runtime) updateDesiredState(s registry.Service, desired registry.DesiredState) (registry.Service, error) {
-	if s.DesiredState == desired {
-		return s, nil
-	}
-
-	services := r.registry.Services()
-	found := false
-	for i := range services {
-		if services[i].EnvironmentID == s.EnvironmentID && services[i].ID == s.ID {
-			services[i].DesiredState = desired
-			found = true
-			break
-		}
-	}
-	if !found {
-		return registry.Service{}, &Failure{Code: "lifecycle-conflict"}
-	}
-
-	candidate, err := registry.NewSnapshot(r.registry.Environments(), services)
-	if err != nil {
-		return registry.Service{}, &Failure{Code: "lifecycle-conflict"}
-	}
-	var updated registry.Service
-	for _, service := range candidate.Services() {
-		if service.EnvironmentID == s.EnvironmentID && service.ID == s.ID {
-			updated = service
-			break
-		}
-	}
-	if updated.ID == "" {
-		return registry.Service{}, &Failure{Code: "lifecycle-conflict"}
-	}
-	if r.store != nil {
-		if err := r.store.Save(candidate); err != nil {
-			return registry.Service{}, &Failure{Code: "lifecycle-conflict", Evidence: "desired service state could not be saved after the Jinushi operation succeeded"}
-		}
-	}
-
-	r.registry = candidate
-	r.services[key(string(updated.EnvironmentID), string(updated.ID))] = updated
-	return updated, nil
-}
-
 func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -404,29 +362,19 @@ func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, 
 		}
 		return Service{}, classify(err)
 	}
-	if action != "stop" {
-		if _, stateErr := processState(run); stateErr != nil {
-			return Service{}, &Failure{Code: "lifecycle-conflict"}
-		}
-	}
+	r.jinushi[env] = "ready"
 	if action == "stop" || run.ID != "" {
 		delete(r.pending, key(env, id))
 	}
-	desired := registry.DesiredRunning
-	if action == "stop" {
-		desired = registry.DesiredStopped
-	}
-	s, err = r.updateDesiredState(s, desired)
-	if err != nil {
-		return Service{}, err
-	}
-	r.jinushi[env] = "ready"
 	if action == "stop" {
 		for _, ep := range s.Endpoints {
 			identity := tunnel.Identity{Environment: env, Service: id, Endpoint: string(ep.ID)}
 			if _, getErr := r.tunnels.Get(identity); getErr == nil {
-				_, _ = r.tunnels.Stop(ctx, identity)
+				if _, stopErr := r.tunnels.Stop(ctx, identity); stopErr != nil {
+					continue
+				}
 			}
+			delete(r.endpointFailures, identity)
 		}
 	} else {
 		r.ensureHealth(ctx, s)
@@ -479,10 +427,35 @@ func (r *Runtime) ensureHealth(ctx context.Context, s registry.Service) {
 }
 func (r *Runtime) ensure(ctx context.Context, s registry.Service, ep registry.Endpoint) (tunnel.Snapshot, error) {
 	identity := tunnel.Identity{Environment: string(s.EnvironmentID), Service: string(s.ID), Endpoint: string(ep.ID)}
-	if current, err := r.tunnels.Get(identity); err == nil && (current.State == tunnel.StateReady || current.State == tunnel.StateStarting) {
-		return current, nil
+	port, err := r.resolveEndpoint(ctx, s, ep)
+	if err != nil {
+		if current, getErr := r.tunnels.Get(identity); getErr == nil && (current.State == tunnel.StateReady || current.State == tunnel.StateStarting) {
+			if _, stopErr := r.tunnels.Stop(ctx, identity); stopErr != nil {
+				err = errors.New(endpointEvidenceStale)
+			}
+		}
+		r.endpointFailures[identity] = err.Error()
+		return tunnel.Snapshot{}, err
 	}
-	return r.tunnels.Start(ctx, tunnel.Request{Identity: identity, SSHHost: r.bindings[string(s.EnvironmentID)].environment.SSHHost, RemotePort: uint16(ep.RemotePort)})
+	delete(r.endpointFailures, identity)
+	if current, getErr := r.tunnels.Get(identity); getErr == nil {
+		if (current.State == tunnel.StateReady || current.State == tunnel.StateStarting) && current.RemotePort == port {
+			return current, nil
+		}
+		if current.State == tunnel.StateReady || current.State == tunnel.StateStarting {
+			if _, stopErr := r.tunnels.Stop(ctx, identity); stopErr != nil {
+				failure := errors.New(endpointEvidenceStale)
+				r.endpointFailures[identity] = failure.Error()
+				return current, failure
+			}
+		}
+	}
+	snapshot, err := r.tunnels.Start(ctx, tunnel.Request{Identity: identity, SSHHost: r.bindings[string(s.EnvironmentID)].environment.SSHHost, RemotePort: port})
+	if err != nil {
+		r.endpointFailures[identity] = "The SSH tunnel to the registered endpoint could not be established."
+		return snapshot, err
+	}
+	return snapshot, nil
 }
 func (r *Runtime) Ensure(ctx context.Context, env, id, endpoint string) (Endpoint, error) {
 	r.mu.Lock()
@@ -498,9 +471,20 @@ func (r *Runtime) Ensure(ctx context.Context, env, id, endpoint string) (Endpoin
 		if string(ep.ID) == endpoint {
 			snap, err := r.ensure(ctx, s, ep)
 			if err != nil {
-				return Endpoint{}, &Failure{Code: "tunnel-unavailable"}
+				identity := tunnel.Identity{Environment: env, Service: id, Endpoint: endpoint}
+				evidence := r.endpointFailures[identity]
+				if evidence == "" {
+					evidence = "The SSH tunnel to the registered endpoint could not be established."
+				}
+				failure := &Failure{Code: "endpoint-unavailable", Evidence: bounded(evidence)}
+				return Endpoint{}, failure
 			}
-			return r.endpointView(s, ep, health.EndpointObservation{State: health.EndpointAvailable}, snap), nil
+			state, probeErr := r.endpointState(ctx, env, id, endpoint)
+			observation := health.EndpointObservation{State: state}
+			if probeErr != nil {
+				observation.Error = probeErr.Error()
+			}
+			return r.endpointView(s, ep, observation, snap), nil
 		}
 	}
 	return Endpoint{}, &Failure{Code: "unknown-identity"}
@@ -542,8 +526,18 @@ func processState(run jinushi.Run) (health.ProcessState, error) {
 }
 func (r *Runtime) readiness(ctx context.Context, env, id string) (health.ReadinessState, error) {
 	s := r.services[key(env, id)]
-	snap, err := r.tunnels.Get(tunnel.Identity{Environment: env, Service: id, Endpoint: string(s.Health.EndpointID)})
-	if err != nil || snap.State != tunnel.StateReady {
+	identity := tunnel.Identity{Environment: env, Service: id, Endpoint: string(s.Health.EndpointID)}
+	if failure := r.endpointFailures[identity]; strings.HasPrefix(failure, "Dynamic endpoint") {
+		return health.ReadinessError, errors.New(failure)
+	}
+	snap, err := r.tunnels.Get(identity)
+	if err != nil {
+		return health.ReadinessUnknown, nil
+	}
+	if snap.State == tunnel.StateFailed {
+		return health.ReadinessUnknown, nil
+	}
+	if snap.State != tunnel.StateReady {
 		return health.ReadinessUnknown, nil
 	}
 	u, err := url.Parse(snap.LocalURL)
@@ -569,21 +563,43 @@ func (r *Runtime) readiness(ctx context.Context, env, id string) (health.Readine
 	}
 	return health.ReadinessUnhealthy, nil
 }
-func (r *Runtime) endpointState(_ context.Context, env, id, ep string) (health.EndpointState, error) {
-	snap, err := r.tunnels.Get(tunnel.Identity{Environment: env, Service: id, Endpoint: ep})
+func (r *Runtime) endpointState(ctx context.Context, env, id, ep string) (health.EndpointState, error) {
+	identity := tunnel.Identity{Environment: env, Service: id, Endpoint: ep}
+	if failure := r.endpointFailures[identity]; failure != "" {
+		return health.EndpointError, errors.New(failure)
+	}
+	snap, err := r.tunnels.Get(identity)
 	if err != nil {
-		return health.EndpointUnknown, nil
+		return health.EndpointUnavailable, nil
 	}
 	switch snap.State {
 	case tunnel.StateReady:
+		if err := r.probeApplicationEndpoint(ctx, snap.LocalURL); err != nil {
+			return health.EndpointUnavailable, err
+		}
 		return health.EndpointAvailable, nil
 	case tunnel.StateFailed:
-		return health.EndpointError, nil
+		return health.EndpointError, errors.New("The SSH tunnel to the registered endpoint could not be established.")
 	case tunnel.StateStopped:
 		return health.EndpointUnavailable, nil
 	default:
 		return health.EndpointUnknown, nil
 	}
+}
+
+func (r *Runtime) probeApplicationEndpoint(ctx context.Context, localURL string) error {
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, localURL, nil)
+	if err != nil {
+		return errors.New(endpointApplicationDown)
+	}
+	response, err := r.httpClient.Do(request)
+	if err != nil {
+		return errors.New(endpointApplicationDown)
+	}
+	_ = response.Body.Close()
+	return nil
 }
 func (r *Runtime) Poll(ctx context.Context) error {
 	r.mu.Lock()
@@ -594,6 +610,16 @@ func (r *Runtime) Poll(ctx context.Context) error {
 	for _, s := range r.registry.Services() {
 		if s.DesiredState == registry.DesiredRunning {
 			r.ensureHealth(ctx, s)
+		}
+		for _, endpoint := range s.Endpoints {
+			if endpoint.Resolution == nil || (endpoint.ID == s.Health.EndpointID && s.DesiredState == registry.DesiredRunning) {
+				continue
+			}
+			identity := tunnel.Identity{Environment: string(s.EnvironmentID), Service: string(s.ID), Endpoint: string(endpoint.ID)}
+			current, err := r.tunnels.Get(identity)
+			if (err == nil && (current.State == tunnel.StateReady || current.State == tunnel.StateStarting)) || r.endpointFailures[identity] != "" {
+				_, _ = r.ensure(ctx, s, endpoint)
+			}
 		}
 	}
 	defer r.mu.Unlock()
@@ -695,7 +721,11 @@ func (r *Runtime) endpointView(s registry.Service, ep registry.Endpoint, obs hea
 	if t == "" {
 		t = tunnel.StateStopped
 	}
-	return Endpoint{ID: string(ep.ID), Label: ep.Label, EndpointState: state, TunnelState: t, LocalURL: snap.LocalURL, Failure: tunnelFailure(snap)}
+	failure := obs.Error
+	if failure == "" {
+		failure = tunnelFailure(snap)
+	}
+	return Endpoint{ID: string(ep.ID), Label: ep.Label, EndpointState: state, TunnelState: t, LocalURL: snap.LocalURL, Failure: bounded(failure)}
 }
 func (r *Runtime) serviceView(s registry.Service, obs health.ServiceObservation) Service {
 	result := Service{ID: string(s.ID), DesiredState: s.DesiredState, State: obs.State, Process: obs.Process, Readiness: obs.Readiness, ProcessError: observationError(obs.ProcessError), ReadinessError: observationError(obs.ReadinessError), Endpoints: []Endpoint{}}

@@ -138,6 +138,23 @@ func TestNewSnapshotRejectsInvalidDefinitions(t *testing.T) {
 			services[0].Endpoints[0].RemotePort = 65536
 			return envs, services
 		}},
+		{name: "dynamic endpoint missing descriptor type", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			services[0].Endpoints[0].Resolution = &EndpointResolution{Path: "/run/endpoint.json"}
+			return envs, services
+		}},
+		{name: "dynamic endpoint requires a safe absolute path", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			services[0].Endpoints[0].Resolution = &EndpointResolution{Type: EndpointResolutionJSONURLFile, Path: "~/.cache/service/endpoint.json"}
+			return envs, services
+		}},
+		{name: "dynamic endpoint rejects shell path syntax", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			services[0].Endpoints[0].Resolution = &EndpointResolution{Type: EndpointResolutionJSONURLFile, Path: "/run/endpoint;touch"}
+			return envs, services
+		}},
+		{name: "dynamic endpoint rejects non-loopback address", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
+			services[0].Endpoints[0].RemoteAddress = "0.0.0.0"
+			services[0].Endpoints[0].Resolution = &EndpointResolution{Type: EndpointResolutionJSONURLFile, Path: "/run/endpoint.json"}
+			return envs, services
+		}},
 		{name: "duplicate endpoint", mutate: func(envs []Environment, services []Service) ([]Environment, []Service) {
 			services[0].Endpoints = append(services[0].Endpoints, services[0].Endpoints[0])
 			return envs, services
@@ -152,6 +169,21 @@ func TestNewSnapshotRejectsInvalidDefinitions(t *testing.T) {
 				t.Fatal("NewSnapshot() succeeded for invalid definition")
 			}
 		})
+	}
+}
+
+func TestDynamicEndpointResolutionIsValidatedAndDefensivelyCopied(t *testing.T) {
+	environments, services := registryFixture()
+	services[0].Endpoints[0].RemotePort = 33031 // An old static value must not override explicit discovery.
+	services[0].Endpoints[0].Resolution = &EndpointResolution{Type: EndpointResolutionJSONURLFile, Path: "/home/dev/.cache/yokodori/endpoint.json"}
+	snapshot, err := NewSnapshot(environments, services)
+	if err != nil {
+		t.Fatalf("NewSnapshot() dynamic endpoint error = %v", err)
+	}
+	services[0].Endpoints[0].Resolution.Path = "/changed/endpoint.json"
+	got := snapshot.Services()[0].Endpoints[0]
+	if got.RemotePort != 33031 || got.Resolution == nil || got.Resolution.Type != EndpointResolutionJSONURLFile || got.Resolution.Path != "/home/dev/.cache/yokodori/endpoint.json" {
+		t.Fatalf("dynamic endpoint = %#v; want original descriptor and legacy static value", got)
 	}
 }
 
