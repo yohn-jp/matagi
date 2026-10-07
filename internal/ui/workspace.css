@@ -1,4 +1,4 @@
-/* Matagi layout compositions over the Hachidori-derived visual system. */
+/* Matagi workspace layout compositions over the shared visual system. */
 .shell { max-width: var(--ws-max); margin: auto; padding: var(--sp-5); }
 .mast { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); padding-bottom: var(--sp-4); }
 .flow { display: grid; gap: var(--sp-5); }

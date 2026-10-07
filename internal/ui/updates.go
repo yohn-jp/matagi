@@ -33,6 +33,8 @@ type UpdatesView struct {
 	Channels          []update.Channel
 	Op, LastOp        *updateOperationView
 	OpHint, CheckHint string
+	ReadyHint         string
+	StateHint         string
 	ResultHint        string
 	OpOutcome         []string
 }
@@ -41,7 +43,8 @@ type updateOperationView struct {
 	update.Operation
 	Determinate bool
 	Percent     float64
-	Position    string
+	PhaseNumber int
+	PhaseCount  int
 	Stages      []updateStage
 }
 
@@ -92,12 +95,20 @@ func (h *handler) updatesView() *UpdatesView {
 	if status.LastCheck != nil && !status.LastCheck.OK {
 		v.CheckHint = update.Hints[status.LastCheck.Class]
 	}
+	if status.ReadyProblem != "" {
+		v.ReadyHint = "This candidate is not installable. Review the status and error detail above, then check for updates or download another verified candidate."
+	}
+	if status.Err != "" {
+		v.StateHint = "The updater could not read or save local update state. Check Matagi's state directory and review the error detail."
+	}
 	if status.Result != nil {
 		switch status.Result.Outcome {
 		case update.OutcomeFailed:
 			v.ResultHint = update.Hints[update.ClassReplace]
 		case update.OutcomeRestart:
 			v.ResultHint = update.Hints[update.ClassRestart]
+		case update.OutcomeRefused:
+			v.ResultHint = "The update attempt was refused. Review the current update status and error detail before retrying."
 		}
 	}
 	return v
@@ -116,7 +127,8 @@ func updateOperation(op *update.Operation) *updateOperationView {
 		plan = op.Phases
 	}
 	if phaseIndex := indexOf(plan, op.Phase); phaseIndex >= 0 {
-		v.Position = fmt.Sprintf("%d of %d", phaseIndex+1, len(plan))
+		v.PhaseNumber = phaseIndex + 1
+		v.PhaseCount = len(plan)
 	}
 	v.Stages = make([]updateStage, 0, len(plan))
 	for _, phase := range plan {
@@ -246,7 +258,7 @@ func updateTime(value time.Time) string {
 	if value.IsZero() {
 		return ""
 	}
-	return value.Local().Format("2006-01-02 15:04 MST")
+	return value.Local().Format("2006-01-02 15:04:05")
 }
 
 // updatesPage renders only local update state. It never checks for releases.
@@ -328,7 +340,7 @@ func updateErrorHint(err error) string {
 			return hint
 		}
 		if updateErr.Class == update.ClassRefused {
-			return "Another update action is in progress. Wait for it to finish."
+			return "This action is unavailable in the current update state. Review the selected channel, ready candidate and operation status before retrying."
 		}
 	}
 	return "The update action could not be completed."

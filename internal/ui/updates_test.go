@@ -152,27 +152,71 @@ func TestUpdatesPageShowsDownloadProgressAndDisablesConflictingActions(t *testin
 		Started: time.Now().Add(-time.Second),
 	}
 	f := &fakeUIUpdates{status: status}
-	h, _ := newUpdatesTestHandler(t, f, i18n.English)
-	response := httptest.NewRecorder()
-	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/updates", nil))
-	body := response.Body.String()
-	for _, want := range []string{`id="updates-busy-note"`, `id="updates-active-operation"`, `role="progressbar"`, `aria-valuenow="50"`, "8.0 MiB of 16.0 MiB", `id="updates-check"`, `<select name="channel" disabled>`} {
-		if !strings.Contains(body, want) {
-			t.Errorf("progress page lacks %q", want)
+	h, store := newUpdatesTestHandler(t, f, i18n.English)
+	for _, locale := range []i18n.Locale{i18n.English, i18n.Japanese} {
+		if err := store.SetLocale(string(locale)); err != nil {
+			t.Fatal(err)
 		}
-	}
-	start := strings.Index(body, `id="updates-download-0.2.6"`)
-	if start < 0 {
-		t.Fatal("download candidate form is missing")
-	}
-	if end := strings.Index(body[start:], "</form>"); end < 0 || !strings.Contains(body[start:start+end], "disabled") {
-		t.Error("Download remains enabled while an update is in progress")
-	}
-	if !strings.Contains(body, `data-pending="Checking…" disabled`) || !strings.Contains(body, `data-pending="Restarting…" disabled`) {
-		t.Error("Check or Restart & update remains enabled while an update is in progress")
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/updates", nil))
+		body := response.Body.String()
+		for _, want := range []string{`id="updates-busy-note"`, `id="updates-active-operation"`, `role="progressbar"`, `aria-valuenow="50"`, `id="updates-check"`, `<select name="channel" disabled>`} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s progress page lacks %q", locale, want)
+			}
+		}
+		position := locale.T("Phase %d of %d", 2, 3)
+		if !strings.Contains(body, html.EscapeString(position)) {
+			t.Errorf("%s progress page lacks localized phase position %q", locale, position)
+		}
+		if locale == i18n.English && !strings.Contains(body, "8.0 MiB of 16.0 MiB") {
+			t.Error("English progress page lacks the byte total")
+		}
+		if locale == i18n.Japanese && strings.Contains(body, "Phase 2 of 3") {
+			t.Error("Japanese progress page contains the English phase position")
+		}
+		start := strings.Index(body, `id="updates-download-0.2.6"`)
+		if start < 0 {
+			t.Fatal("download candidate form is missing")
+		}
+		if end := strings.Index(body[start:], "</form>"); end < 0 || !strings.Contains(body[start:start+end], "disabled") {
+			t.Error("Download remains enabled while an update is in progress")
+		}
+		checking := html.EscapeString(locale.T("Checking…"))
+		restarting := html.EscapeString(locale.T("Restarting…"))
+		if !strings.Contains(body, `data-pending="`+checking+`" disabled`) || !strings.Contains(body, `data-pending="`+restarting+`" disabled`) {
+			t.Error("Check or Restart & update remains enabled while an update is in progress")
+		}
 	}
 	if f.checks != 0 || len(f.downloads) != 0 || f.installs != 0 {
 		t.Fatal("reading progress performed a network or install action")
+	}
+}
+
+func TestUpdatesPageLocalizesSuccessfulCheckWithNoEligibleReleases(t *testing.T) {
+	status := baseUpdatesStatus(t)
+	status.LastCheck = &update.LastCheck{
+		Time:    status.LastCheck.Time,
+		Channel: update.Stable,
+		OK:      true,
+		Message: "success-message-must-not-be-shown",
+	}
+	status.Check = &update.CheckResult{Time: status.LastCheck.Time, Channel: update.Stable}
+	h, store := newUpdatesTestHandler(t, &fakeUIUpdates{status: status}, i18n.English)
+	for _, locale := range []i18n.Locale{i18n.English, i18n.Japanese} {
+		if err := store.SetLocale(string(locale)); err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/updates", nil))
+		body := response.Body.String()
+		want := html.EscapeString(locale.T("No eligible releases on this channel."))
+		if !strings.Contains(body, want) {
+			t.Errorf("%s page lacks localized empty-release message %q", locale, want)
+		}
+		if strings.Contains(body, "success-message-must-not-be-shown") {
+			t.Errorf("%s page displayed a raw success message instead of deriving empty state", locale)
+		}
 	}
 }
 
@@ -202,8 +246,33 @@ func TestUpdatesPostsForwardOnlyExplicitActionsAndSurfaceRefusal(t *testing.T) {
 	response := httptest.NewRecorder()
 	h.ServeHTTP(response, formRequest(http.MethodPost, "/updates/check", nil, h.token))
 	body := response.Body.String()
-	if response.Code != http.StatusOK || !strings.Contains(body, i18n.Japanese.T("Another update action is in progress. Wait for it to finish.")) || !strings.Contains(body, "another update action is in progress") {
+	if response.Code != http.StatusOK || !strings.Contains(body, i18n.Japanese.T("This action is unavailable in the current update state. Review the selected channel, ready candidate and operation status before retrying.")) || !strings.Contains(body, "another update action is in progress") {
 		t.Fatalf("refused check lacks a translated hint and literal evidence: %d %s", response.Code, body)
+	}
+}
+
+func TestUpdatesPageAddsLocalizedHintsBesideUpdateStateEvidence(t *testing.T) {
+	status := baseUpdatesStatus(t)
+	status.ReadyProblem = "staged executable failed verification"
+	status.Err = "could not load update state"
+	status.Result = &update.Result{Outcome: update.OutcomeRefused, Message: "install refused because the candidate is unavailable"}
+	h, _ := newUpdatesTestHandler(t, &fakeUIUpdates{status: status}, i18n.Japanese)
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/updates", nil))
+	body := response.Body.String()
+	for _, pair := range [][2]string{
+		{"updates-ready-problem", "This candidate is not installable. Review the status and error detail above, then check for updates or download another verified candidate."},
+		{"updates-state-error", "The updater could not read or save local update state. Check Matagi's state directory and review the error detail."},
+		{"updates-result", "The update attempt was refused. Review the current update status and error detail before retrying."},
+	} {
+		if !strings.Contains(body, `id="`+pair[0]+`"`) || !strings.Contains(body, html.EscapeString(i18n.Japanese.T(pair[1]))) {
+			t.Errorf("Japanese page lacks translated hint %q near %s", pair[1], pair[0])
+		}
+	}
+	for _, detail := range []string{"staged executable failed verification", "could not load update state", "install refused because the candidate is unavailable"} {
+		if !strings.Contains(body, detail) {
+			t.Errorf("Japanese page lost update diagnostic %q", detail)
+		}
 	}
 }
 

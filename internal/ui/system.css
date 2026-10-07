@@ -1,4 +1,4 @@
-/* Adapted from Hachidori's shared visual system for Matagi's desktop.
+/* Matagi's shared visual system.
    Change a role here, never per surface.
 
    Composition comes before containers: the page is the canvas, and hierarchy

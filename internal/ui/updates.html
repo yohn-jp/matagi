@@ -28,7 +28,7 @@
         <div><dt>{{t $.Locale "Installed version"}}</dt><dd class="id" id="updates-installed-version">{{if .Installed.Known}}{{.Installed.Version}}{{else}}{{t $.Locale "unknown (identified by an explicit check)"}}{{end}}</dd></div>
         {{with .Installed.SHA256}}<div><dt>{{t $.Locale "Executable SHA-256"}}</dt><dd class="id">{{.}}</dd></div>{{end}}
         <div><dt>{{t $.Locale "Last check"}}</dt><dd id="updates-last-check">
-          {{with .LastCheck}}{{when .Time}} · {{.Channel}} · {{if .OK}}{{if .Message}}{{.Message}}{{else}}{{t $.Locale "latest"}}{{with .Latest}} <span class="id">{{.}}</span>{{end}}{{end}}{{else}}<span class="bad-t">{{t $.Locale "failed"}}: {{.Message}}</span>{{end}}{{else}}{{t $.Locale "never"}}{{end}}
+          {{with .LastCheck}}{{when .Time}} · {{.Channel}} · {{if .OK}}{{if .Latest}}{{t $.Locale "latest"}} <span class="id">{{.Latest}}</span>{{else}}{{t $.Locale "No eligible releases on this channel."}}{{end}}{{else}}<span class="bad-t">{{t $.Locale "failed"}}: {{.Message}}</span>{{end}}{{else}}{{t $.Locale "never"}}{{end}}
         </dd></div>
       </dl>
       <form method="post" action="/updates/channel" class="updates-channel" id="updates-channel">
@@ -99,11 +99,11 @@
           <div class="updates-operation-heading tone-active"><strong class="status">{{t $.Locale "RUNNING"}}</strong><span>{{t $.Locale (opLabel .Kind)}}</span>{{with .Tag}}<span class="id">{{.}}</span>{{end}}<time>{{when .Started}}</time></div>
           {{if .Stages}}<ol class="stages">{{range .Stages}}<li class="{{.Status}}"><span>{{t $.Locale .Label}}</span><span class="sub">{{t $.Locale (stageWord .Status)}}</span></li>{{end}}</ol>{{end}}
           {{if .Step}}
-            <p class="op-line">{{with .Position}}{{t $.Locale "phase"}} {{.}} · {{end}}{{t $.Locale (stepLabel .Step)}} {{if .Detail}}<span class="id">{{.Detail}}</span>{{end}}{{if .Determinate}} · {{bytesIn .Done}} {{t $.Locale "of"}} {{bytesIn .Total}} ({{printf "%.0f" .Percent}}%){{else if and (eq .Step "downloading") .Done}} · {{bytesIn .Done}} {{t $.Locale "received (the server did not state a total size)"}}{{end}}</p>
+            <p class="op-line">{{if .PhaseNumber}}{{t $.Locale "Phase %d of %d" .PhaseNumber .PhaseCount}} · {{end}}{{t $.Locale (stepLabel .Step)}} {{if .Detail}}<span class="id">{{.Detail}}</span>{{end}}{{if .Determinate}} · {{bytesIn .Done}} {{t $.Locale "of"}} {{bytesIn .Total}} ({{printf "%.0f" .Percent}}%){{else if and (eq .Step "downloading") .Done}} · {{bytesIn .Done}} {{t $.Locale "received (the server did not state a total size)"}}{{end}}</p>
             {{if .Determinate}}<div class="bar progress" role="progressbar" aria-label="{{t $.Locale (stepLabel .Step)}}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{printf "%.0f" .Percent}}"><span style="width:{{printf "%.1f" .Percent}}%"></span></div>
             {{else}}<div class="bar progress indeterminate" role="progressbar" aria-label="{{t $.Locale (stepLabel .Step)}}"><span></span></div>{{end}}
           {{else}}
-            <p class="op-line">{{with .Position}}{{t $.Locale "phase"}} {{.}} · {{end}}{{if .Phase}}{{t $.Locale "Working"}}{{else}}{{t $.Locale "Starting"}}{{end}}</p>
+            <p class="op-line">{{if .PhaseNumber}}{{t $.Locale "Phase %d of %d" .PhaseNumber .PhaseCount}} · {{end}}{{if .Phase}}{{t $.Locale "Working"}}{{else}}{{t $.Locale "Starting"}}{{end}}</p>
             <div class="bar progress indeterminate" role="progressbar" aria-label="{{if .Phase}}{{t $.Locale "Working"}}{{else}}{{t $.Locale "Starting"}}{{end}}"><span></span></div>
           {{end}}
         </div>
@@ -141,7 +141,7 @@
           <div><dt>{{t $.Locale "Verified"}}</dt><dd>{{t $.Locale "matches the release checksum"}} · {{when .Created}}</dd></div>
           <div><dt>{{t $.Locale "Replaces"}}</dt><dd class="id">{{.Target}}</dd></div>
         </dl>
-        {{if $.Upd.ReadyProblem}}<p class="msg bad" role="alert" id="updates-ready-problem">{{$.Upd.ReadyProblem}}</p>
+        {{if $.Upd.ReadyProblem}}<p class="msg bad" role="alert" id="updates-ready-problem"><strong>{{t $.Locale $.Upd.ReadyHint}}</strong> <span class="id">{{$.Upd.ReadyProblem}}</span></p>
         {{else if not $.Upd.Supported}}<p class="note">{{t $.Locale "Restart & update is available only in the Windows desktop application."}}</p>
         {{else}}
           <form method="post" action="/updates/install" class="inline" id="updates-install" data-confirm="{{t $.Locale "Close Matagi, replace the executable and reopen it? Matagi-owned settings, registered environments and services remain stored."}}">
@@ -163,7 +163,7 @@
         {{with $.Upd.ResultHint}}<p class="note">{{t $.Locale .}}</p>{{end}}
       </section>
     {{end}}
-    {{with .Err}}<p class="msg bad" role="alert">{{.}}</p>{{end}}
+    {{with .Err}}<p class="msg bad" role="alert" id="updates-state-error"><strong>{{t $.Locale $.Upd.StateHint}}</strong> <span class="id">{{.}}</span></p>{{end}}
   </div>
   {{end}}
 </main>
