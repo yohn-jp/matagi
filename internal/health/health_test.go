@@ -93,6 +93,30 @@ func TestPollAggregatesDeterministicIndependentStates(t *testing.T) {
 	}
 }
 
+func TestAggregateServiceStateRequiresLifecycleEvidenceForStarting(t *testing.T) {
+	tests := []struct {
+		name      string
+		process   ProcessState
+		readiness ReadinessState
+		want      ServiceState
+	}{
+		{name: "unowned process with failed readiness probe", process: ProcessUnknown, readiness: ReadinessNotReady, want: ServiceUnknown},
+		{name: "running process without readiness evidence", process: ProcessRunning, readiness: ReadinessUnknown, want: ServiceUnknown},
+		{name: "starting process with failed readiness probe", process: ProcessStarting, readiness: ReadinessNotReady, want: ServiceStarting},
+		{name: "running process with failed readiness probe", process: ProcessRunning, readiness: ReadinessNotReady, want: ServiceStarting},
+		{name: "ready endpoint", process: ProcessUnknown, readiness: ReadinessReady, want: ServiceReady},
+		{name: "proven terminal run", process: ProcessStopped, readiness: ReadinessNotReady, want: ServiceStopped},
+		{name: "unhealthy endpoint", process: ProcessUnknown, readiness: ReadinessUnhealthy, want: ServiceUnhealthy},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := AggregateServiceState(test.process, test.readiness); got != test.want {
+				t.Fatalf("AggregateServiceState(%q, %q) = %q, want %q", test.process, test.readiness, got, test.want)
+			}
+		})
+	}
+}
+
 func TestUnreachableEnvironmentDoesNotFabricateRemoteState(t *testing.T) {
 	processCalled := false
 	readinessCalled := false

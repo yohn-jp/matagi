@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yohn-jp/matagi/internal/config"
+	"github.com/yohn-jp/matagi/internal/jinushi"
 	"github.com/yohn-jp/matagi/internal/registry"
 	"github.com/yohn-jp/matagi/internal/ssh"
 	"github.com/yohn-jp/matagi/internal/tunnel"
@@ -94,6 +95,45 @@ func TestExecutorTranslation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestClassifyLifecycleFailuresKeepsAuthorityBoundaries(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		want         string
+		wantEvidence string
+	}{
+		{
+			name: "SSH transport",
+			err:  &jinushi.Failure{Kind: jinushi.KindTransport, Cause: &jinushi.ExecutionError{Kind: jinushi.ExecutionTransportFailure, Err: &ssh.Error{Kind: ssh.FailureTransport}}},
+			want: "host-unreachable",
+		},
+		{
+			name: "SSH command timeout",
+			err:  &jinushi.Failure{Kind: jinushi.KindTimeout, Cause: &jinushi.ExecutionError{Kind: jinushi.ExecutionTimeout, Err: &ssh.Error{Kind: ssh.FailureTimeout}}},
+			want: "ssh-timeout",
+		},
+		{
+			name: "local SSH client failure",
+			err:  &jinushi.Failure{Kind: jinushi.KindTransport, Cause: &jinushi.ExecutionError{Kind: jinushi.ExecutionTransportFailure, Err: &ssh.Error{Kind: ssh.FailureExecutableLookup}}},
+			want: "ssh-client-failed",
+		},
+		{name: "Jinushi unavailable", err: &jinushi.Failure{Kind: jinushi.KindSupervisorUnavailable}, want: "jinushi-unavailable"},
+		{name: "Jinushi command rejection", err: &jinushi.Failure{Kind: jinushi.KindCommand, Code: "invalid-run"}, want: "jinushi-command-failed", wantEvidence: "invalid-run"},
+		{name: "unsafe Jinushi code is not evidence", err: &jinushi.Failure{Kind: jinushi.KindCommand, Code: "path /srv/private"}, want: "jinushi-command-failed"},
+		{name: "Jinushi protocol failure", err: &jinushi.Failure{Kind: jinushi.KindProtocol}, want: "jinushi-protocol-failed"},
+		{name: "ambiguous lifecycle evidence", err: &jinushi.Failure{Kind: jinushi.KindAmbiguous}, want: "lifecycle-conflict"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var failure *Failure
+			if err := classify(test.err); !errors.As(err, &failure) || failure.Code != test.want || failure.Evidence != test.wantEvidence {
+				t.Fatalf("classify() = %v, want code %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestStateDeterministic(t *testing.T) {
 	r, _ := fixture(t)
 	a, b := r.Snapshot(), r.Snapshot()

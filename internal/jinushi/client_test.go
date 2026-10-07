@@ -168,6 +168,39 @@ func TestStartDiscoversCorrelatedRunAcrossListPages(t *testing.T) {
 	}
 }
 
+func TestStartDoesNotAdoptUncorrelatedManualRun(t *testing.T) {
+	manual := testRun("manual-run", StateRunning, 3, "")
+	manual.Spec.Correlation = map[string]string{"operator": "manual"}
+	created := testRun("managed-run", StateAccepted, 1, "service-a")
+	runCalled := false
+	executor := &fakeExecutor{run: func(_ context.Context, argv []string, _ time.Duration) (CommandResult, error) {
+		switch argv[1] {
+		case "status":
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "status": map[string]any{}}), nil
+		case "list":
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "runs": []Run{manual}}), nil
+		case "run":
+			runCalled = true
+			if !containsArg(argv, "--correlation=owner=service-a") {
+				t.Fatalf("new Run omitted Matagi owner correlation: %v", argv)
+			}
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "run": created}), nil
+		default:
+			t.Fatalf("unexpected command %v", argv)
+			return CommandResult{}, nil
+		}
+	}}
+	client := newTestClient(t, executor, Options{CommandTimeout: time.Second})
+
+	run, err := client.Start(context.Background(), StartRequest{Service: Service{ID: "service-a", Argv: []string{"serve"}, Cwd: "/srv/app"}, SubmissionID: "fresh-id"})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if !runCalled || run.ID != "managed-run" {
+		t.Fatalf("Start() = %#v, run command called = %t; manual Run was adopted", run, runCalled)
+	}
+}
+
 func TestAmbiguousStartRetryReusesSubmissionID(t *testing.T) {
 	runAttempts := 0
 	executor := &fakeExecutor{run: func(_ context.Context, argv []string, _ time.Duration) (CommandResult, error) {

@@ -223,7 +223,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 				}
 				serviceObservation.Readiness, serviceObservation.ReadinessError = normalizeReadiness(readiness, err)
 			}
-			serviceObservation.State = deriveServiceState(serviceObservation.Process, serviceObservation.Readiness)
+			serviceObservation.State = AggregateServiceState(serviceObservation.Process, serviceObservation.Readiness)
 			serviceObservation.Endpoints = make([]EndpointObservation, 0, len(service.Endpoints))
 			for _, endpoint := range service.Endpoints {
 				state, err := callProbe(ctx, o.options.ProbeTimeout, func(probeCtx context.Context) (EndpointState, error) {
@@ -278,6 +278,67 @@ func (o *Observer) Snapshot() Snapshot {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	return cloneSnapshot(o.snapshot)
+}
+
+// PublishServiceObservation records fresh evidence returned by an explicit
+// lifecycle action. The next Poll replaces it with a complete observation.
+func (o *Observer) PublishServiceObservation(environmentID string, observation ServiceObservation) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	next := cloneSnapshot(o.snapshot)
+	environmentIndex := -1
+	for i := range next.Environments {
+		if next.Environments[i].ID == environmentID {
+			environmentIndex = i
+			break
+		}
+	}
+	if environmentIndex < 0 {
+		var target *EnvironmentTarget
+		for i := range o.environments {
+			if o.environments[i].ID == environmentID {
+				target = &o.environments[i]
+				break
+			}
+		}
+		if target == nil {
+			return false
+		}
+		next.Environments = append(next.Environments, unknownEnvironmentObservation(*target))
+		sort.Slice(next.Environments, func(i, j int) bool { return next.Environments[i].ID < next.Environments[j].ID })
+		for i := range next.Environments {
+			if next.Environments[i].ID == environmentID {
+				environmentIndex = i
+				break
+			}
+		}
+	}
+
+	environment := &next.Environments[environmentIndex]
+	environment.State = ConnectivityConnected
+	environment.Error = ""
+	for i := range environment.Services {
+		if environment.Services[i].ID == observation.ID {
+			observation.Endpoints = append([]EndpointObservation(nil), observation.Endpoints...)
+			environment.Services[i] = observation
+			o.snapshot = next
+			return true
+		}
+	}
+	return false
+}
+
+func unknownEnvironmentObservation(target EnvironmentTarget) EnvironmentObservation {
+	environment := EnvironmentObservation{ID: target.ID, State: ConnectivityUnknown, Services: make([]ServiceObservation, 0, len(target.Services))}
+	for _, service := range target.Services {
+		observation := ServiceObservation{ID: service.ID, State: ServiceUnknown, Process: ProcessUnknown, Readiness: ReadinessUnknown, Endpoints: make([]EndpointObservation, 0, len(service.Endpoints))}
+		for _, endpoint := range service.Endpoints {
+			observation.Endpoints = append(observation.Endpoints, EndpointObservation{ID: endpoint.ID, State: EndpointUnknown})
+		}
+		environment.Services = append(environment.Services, observation)
+	}
+	return environment
 }
 
 func cloneSnapshot(snapshot Snapshot) Snapshot {
@@ -347,7 +408,10 @@ func normalizeEndpoint(state EndpointState, err error) (EndpointState, string) {
 	}
 }
 
-func deriveServiceState(process ProcessState, readiness ReadinessState) ServiceState {
+// AggregateServiceState projects lifecycle and readiness evidence onto the
+// operator-facing service state. Readiness alone cannot imply that a managed
+// launch is in progress.
+func AggregateServiceState(process ProcessState, readiness ReadinessState) ServiceState {
 	switch {
 	case process == ProcessStopped:
 		return ServiceStopped
@@ -355,7 +419,7 @@ func deriveServiceState(process ProcessState, readiness ReadinessState) ServiceS
 		return ServiceUnhealthy
 	case readiness == ReadinessReady:
 		return ServiceReady
-	case process == ProcessStarting || process == ProcessRunning || readiness == ReadinessNotReady:
+	case (process == ProcessStarting || process == ProcessRunning) && readiness == ReadinessNotReady:
 		return ServiceStarting
 	default:
 		return ServiceUnknown

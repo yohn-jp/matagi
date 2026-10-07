@@ -22,19 +22,15 @@ import (
 const commandTimeout = 10 * time.Second
 const probeTimeout = 3 * time.Second
 
-type Failure struct{ Code string }
+type Failure struct {
+	Code     string
+	Evidence string
+}
 
 func (e *Failure) Error() string { return e.Code }
 func classify(err error) error {
 	if err == nil {
 		return nil
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return &Failure{Code: "timeout"}
-	}
-	var transport *ssh.Error
-	if errors.As(err, &transport) && transport.Kind == ssh.FailureTransport {
-		return &Failure{Code: "host-unreachable"}
 	}
 	var f *jinushi.Failure
 	if errors.As(err, &f) {
@@ -42,12 +38,83 @@ func classify(err error) error {
 		case jinushi.KindBootstrapFailed, jinushi.KindBootstrapNotConfigured, jinushi.KindSupervisorUnavailable:
 			return &Failure{Code: "jinushi-unavailable"}
 		case jinushi.KindTimeout:
-			return &Failure{Code: "timeout"}
+			return &Failure{Code: classifyJinushiTimeout(f)}
+		case jinushi.KindTransport:
+			return &Failure{Code: classifyJinushiTransport(f)}
+		case jinushi.KindCanceled:
+			return &Failure{Code: "operation-canceled"}
 		case jinushi.KindUncertain, jinushi.KindAmbiguous, jinushi.KindNotStopped:
 			return &Failure{Code: "lifecycle-conflict"}
+		case jinushi.KindInvalid:
+			return &Failure{Code: "invalid-request"}
+		case jinushi.KindCommand:
+			return &Failure{Code: "jinushi-command-failed", Evidence: boundedJinushiCode(f.Code)}
+		case jinushi.KindProtocol:
+			return &Failure{Code: "jinushi-protocol-failed", Evidence: boundedJinushiCode(f.Code)}
 		}
 	}
+	var transport *ssh.Error
+	if errors.As(err, &transport) {
+		return &Failure{Code: classifySSHFailure(transport.Kind)}
+	}
+	if errors.Is(err, context.Canceled) {
+		return &Failure{Code: "operation-canceled"}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &Failure{Code: "jinushi-timeout"}
+	}
 	return &Failure{Code: "remote-failure"}
+}
+
+func classifyJinushiTimeout(f *jinushi.Failure) string {
+	var execution *jinushi.ExecutionError
+	if errors.As(f, &execution) && execution.Kind == jinushi.ExecutionTimeout {
+		var sshFailure *ssh.Error
+		if errors.As(execution, &sshFailure) && sshFailure.Kind == ssh.FailureTimeout {
+			return "ssh-timeout"
+		}
+	}
+	return "jinushi-timeout"
+}
+
+func classifyJinushiTransport(f *jinushi.Failure) string {
+	var execution *jinushi.ExecutionError
+	if errors.As(f, &execution) {
+		var sshFailure *ssh.Error
+		if errors.As(execution, &sshFailure) {
+			return classifySSHFailure(sshFailure.Kind)
+		}
+	}
+	return "host-unreachable"
+}
+
+func classifySSHFailure(kind ssh.FailureKind) string {
+	switch kind {
+	case ssh.FailureTransport:
+		return "host-unreachable"
+	case ssh.FailureTimeout:
+		return "ssh-timeout"
+	case ssh.FailureCanceled:
+		return "operation-canceled"
+	case ssh.FailureInvalidRequest:
+		return "invalid-request"
+	case ssh.FailureRemoteCommand:
+		return "jinushi-command-failed"
+	default:
+		return "ssh-client-failed"
+	}
+}
+
+func boundedJinushiCode(code string) string {
+	if code == "" || len(code) > 96 {
+		return ""
+	}
+	for _, char := range code {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '-' && char != '_' && char != '.' {
+			return ""
+		}
+	}
+	return code
 }
 
 type binding struct {
@@ -270,13 +337,18 @@ func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, 
 		r.pending[key(env, id)] = token
 	}
 	var run jinushi.Run
+	var observedRun *jinushi.Run
 	switch action {
 	case "start":
 		run, err = b.control.Start(ctx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: token})
+		observedRun = &run
 	case "restart":
 		run, err = b.control.Restart(ctx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: token})
+		observedRun = &run
 	case "stop":
-		_, err = b.control.Stop(ctx, owner)
+		var status jinushi.ServiceStatus
+		status, err = b.control.Stop(ctx, owner)
+		observedRun = status.Run
 	}
 	if err != nil {
 		var failure *jinushi.Failure
@@ -285,6 +357,7 @@ func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, 
 		}
 		return Service{}, classify(err)
 	}
+	r.jinushi[env] = "ready"
 	if action == "stop" || run.ID != "" {
 		delete(r.pending, key(env, id))
 	}
@@ -298,17 +371,44 @@ func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, 
 	} else {
 		r.ensureHealth(ctx, s)
 	}
-	for _, environment := range r.observer.Snapshot().Environments {
-		if environment.ID == env {
-			for _, observed := range environment.Services {
-				if observed.ID == id {
-					return r.serviceView(s, observed), nil
-				}
-			}
+	observation := r.actionObservation(ctx, s, action, observedRun)
+	r.observer.PublishServiceObservation(env, observation)
+	return r.serviceView(s, observation), nil
+}
+
+func (r *Runtime) actionObservation(ctx context.Context, s registry.Service, action string, run *jinushi.Run) health.ServiceObservation {
+	observation := health.ServiceObservation{ID: string(s.ID), Process: health.ProcessUnknown, Readiness: health.ReadinessUnknown}
+	if run != nil {
+		var err error
+		observation.Process, err = processState(*run)
+		if err != nil {
+			observation.ProcessError = err.Error()
 		}
 	}
-	return r.serviceView(s, health.ServiceObservation{}), nil
+	if action != "stop" {
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		readiness, err := r.readiness(probeCtx, string(s.EnvironmentID), string(s.ID))
+		cancel()
+		observation.Readiness = readiness
+		if ctx.Err() != nil {
+			observation.Readiness = health.ReadinessUnknown
+		} else if err != nil {
+			observation.ReadinessError = err.Error()
+		}
+	}
+	observation.State = health.AggregateServiceState(observation.Process, observation.Readiness)
+	observation.Endpoints = make([]health.EndpointObservation, 0, len(s.Endpoints))
+	for _, endpoint := range s.Endpoints {
+		state, err := r.endpointState(ctx, string(s.EnvironmentID), string(s.ID), string(endpoint.ID))
+		message := ""
+		if err != nil {
+			message = err.Error()
+		}
+		observation.Endpoints = append(observation.Endpoints, health.EndpointObservation{ID: string(endpoint.ID), State: state, Error: message})
+	}
+	return observation
 }
+
 func (r *Runtime) ensureHealth(ctx context.Context, s registry.Service) {
 	for _, ep := range s.Endpoints {
 		if ep.ID == s.Health.EndpointID {
@@ -365,7 +465,11 @@ func (r *Runtime) process(ctx context.Context, env, id string) (health.ProcessSt
 	if status.Run == nil {
 		return health.ProcessUnknown, nil
 	}
-	switch status.Run.State {
+	return processState(*status.Run)
+}
+
+func processState(run jinushi.Run) (health.ProcessState, error) {
+	switch run.State {
 	case jinushi.StateTerminal:
 		return health.ProcessStopped, nil
 	case jinushi.StateRunning:
