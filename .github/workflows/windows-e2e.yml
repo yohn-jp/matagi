@@ -2,10 +2,12 @@ name: Portable Windows candidate certification
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 permissions: {}
 concurrency:
-  group: windows-candidate-${{ github.sha }}
+  group: windows-candidate-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: false
 jobs:
   candidate:
@@ -14,9 +16,11 @@ jobs:
       contents: read
     outputs:
       sha256: ${{ steps.identity.outputs.sha256 }}
+      source: ${{ steps.identity.outputs.source }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
@@ -35,8 +39,10 @@ jobs:
       - name: Bind source and digest
         id: identity
         shell: pwsh
+        env:
+          MATAGI_E2E_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          go run ./test/windows-e2e/cmd/certify -candidate candidate -source $env:GITHUB_SHA record | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          go run ./test/windows-e2e/cmd/certify -candidate candidate -source $env:MATAGI_E2E_SOURCE record | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -52,15 +58,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [startup, surface, transport, lifecycle, single-instance]
+        shard: [startup, surface, transport, lifecycle, single-instance, updates]
     env:
       MATAGI_E2E_CANDIDATE: ${{ github.workspace }}\candidate
-      MATAGI_E2E_SOURCE: ${{ github.sha }}
+      MATAGI_E2E_SOURCE: ${{ needs.candidate.outputs.source }}
       MATAGI_E2E_SHA256: ${{ needs.candidate.outputs.sha256 }}
       MATAGI_E2E_SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ needs.candidate.outputs.source }}
           persist-credentials: false
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
@@ -110,6 +117,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
@@ -126,13 +134,14 @@ jobs:
       - name: Fail-closed aggregate
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.sha256 }}
+          CANDIDATE_SOURCE: ${{ needs.candidate.outputs.source }}
           CANDIDATE_JOB: ${{ needs.candidate.result }}
           SHARD_JOB: ${{ needs.shard.result }}
         run: |
           set -euo pipefail
           test "$CANDIDATE_JOB" = success && test "$SHARD_JOB" = success
           test -n "$CANDIDATE_SHA"
-          go run ./test/windows-e2e/cmd/certify -candidate candidate -evidence evidence -source "$GITHUB_SHA" -sha256 "$CANDIDATE_SHA" -jobs-ok -out certification.json aggregate
+          go run ./test/windows-e2e/cmd/certify -candidate candidate -evidence evidence -source "$CANDIDATE_SOURCE" -sha256 "$CANDIDATE_SHA" -jobs-ok -out certification.json aggregate
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ success() }}
         with:
@@ -152,11 +161,13 @@ jobs:
     env:
       ASSET: matagi-windows-amd64.exe
       CANDIDATE_SHA: ${{ needs.candidate.outputs.sha256 }}
+      CANDIDATE_SOURCE: ${{ needs.candidate.outputs.source }}
       GH_TOKEN: ${{ github.token }}
       GH_REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
@@ -173,7 +184,8 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$CANDIDATE_SHA"
-          go run ./test/windows-e2e/cmd/certify -candidate candidate -source "$GITHUB_SHA" -sha256 "$CANDIDATE_SHA" -out certification/certification.json release-check
+          test -n "$CANDIDATE_SOURCE"
+          go run ./test/windows-e2e/cmd/certify -candidate candidate -source "$CANDIDATE_SOURCE" -sha256 "$CANDIDATE_SHA" -out certification/certification.json release-check
           mkdir release
           cp candidate/matagi.exe "release/$ASSET"
           test "$(sha256sum "release/$ASSET" | cut -d ' ' -f1)" = "$CANDIDATE_SHA"
@@ -198,8 +210,8 @@ jobs:
           tag="0.1.$next-dev"
           gh release create "$tag" "release/$ASSET" "release/$ASSET.sha256" \
             --repo "$GH_REPOSITORY" --title "$tag" \
-            --notes "Portable hosted Windows certification of $GITHUB_SHA (SHA-256 $CANDIDATE_SHA). Not real-host certification." \
-            --target "$GITHUB_SHA" --prerelease --latest=false
+            --notes "Portable hosted Windows certification of $CANDIDATE_SOURCE (SHA-256 $CANDIDATE_SHA). Not real-host certification." \
+            --target "$CANDIDATE_SOURCE" --prerelease --latest=false
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Verify published executable digest
         env:
