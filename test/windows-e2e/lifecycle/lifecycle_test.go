@@ -89,10 +89,16 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	if initial.Process != "unknown" {
 		t.Fatalf("unowned Jinushi Run was adopted as process state %q", initial.Process)
 	}
+	if initial.ProcessError != "" {
+		t.Fatalf("Jinushi process observation failed instead of classifying the unowned Run: %q", initial.ProcessError)
+	}
 
 	localURL := openEndpoint(t, uiURL)
 	waiting := waitServiceProjection(t, apiURL, "unknown", "not-ready")
 	assertNoLaunchInProgress(t, waiting)
+	if waiting.ProcessError != "" {
+		t.Fatalf("Jinushi process observation failed instead of classifying the unowned Run: %q", waiting.ProcessError)
+	}
 	if waiting.DesiredState != "stopped" {
 		t.Fatalf("registered service desired state = %q, want stopped", waiting.DesiredState)
 	}
@@ -306,6 +312,7 @@ type serviceProjection struct {
 	State        string `json:"state"`
 	Process      string `json:"process"`
 	Readiness    string `json:"readiness"`
+	ProcessError string `json:"processError"`
 }
 
 func readServiceProjection(t *testing.T, apiURL string) serviceProjection {
