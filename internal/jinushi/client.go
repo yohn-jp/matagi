@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,14 +16,18 @@ import (
 )
 
 const listPageSize = 64
+const maxRunOutputBytes = 64 * 1024
 
 type response struct {
-	Version    int             `json:"version"`
-	Run        *Run            `json:"run,omitempty"`
-	Runs       []Run           `json:"runs,omitempty"`
-	NextCursor *string         `json:"nextCursor"`
-	Status     json.RawMessage `json:"status,omitempty"`
-	Error      *commandFailure `json:"error,omitempty"`
+	Version      int             `json:"version"`
+	Run          *Run            `json:"run,omitempty"`
+	Runs         []Run           `json:"runs,omitempty"`
+	NextCursor   *string         `json:"nextCursor"`
+	Status       json.RawMessage `json:"status,omitempty"`
+	Data         string          `json:"data,omitempty"`
+	Gap          bool            `json:"gap,omitempty"`
+	RetainedFrom uint64          `json:"retainedFrom,omitempty"`
+	Error        *commandFailure `json:"error,omitempty"`
 }
 
 type commandFailure struct {
@@ -143,6 +148,83 @@ func (c *Client) Status(ctx context.Context, serviceID string) (ServiceStatus, e
 		return ServiceStatus{ServiceID: serviceID, Run: current}, err
 	}
 	return ServiceStatus{ServiceID: serviceID, Run: &inspected}, nil
+}
+
+// ReadRunOutput returns the retained stdout for one opaque Jinushi Run ID.
+// Dynamic endpoint resolution uses it only as per-Run correlation evidence;
+// incomplete or over-limit output is rejected instead of guessed around.
+func (c *Client) ReadRunOutput(ctx context.Context, runID string) ([]byte, error) {
+	if err := c.validContext(ctx); err != nil {
+		return nil, err
+	}
+	if !validRunID(runID) {
+		return nil, &Failure{Kind: KindInvalid, RunID: runID, Message: "Jinushi Run ID is invalid"}
+	}
+	page, err := c.readOutputPage(ctx, runID, 0, maxRunOutputBytes)
+	if err != nil {
+		return nil, err
+	}
+	if page.Gap || page.RetainedFrom != 0 {
+		return nil, &Failure{Kind: KindProtocol, RunID: runID, Message: "Jinushi Run stdout has an output retention gap"}
+	}
+	if len(page.Data) > base64.StdEncoding.EncodedLen(maxRunOutputBytes) {
+		return nil, &Failure{Kind: KindProtocol, RunID: runID, Message: "Jinushi Run stdout exceeds the endpoint evidence limit"}
+	}
+	data, err := base64.StdEncoding.DecodeString(page.Data)
+	if err != nil {
+		return nil, &Failure{Kind: KindProtocol, RunID: runID, Message: "Jinushi Run stdout was not valid base64", Cause: err}
+	}
+	if len(data) > maxRunOutputBytes {
+		return nil, &Failure{Kind: KindProtocol, RunID: runID, Message: "Jinushi Run stdout exceeds the endpoint evidence limit"}
+	}
+	if len(data) < maxRunOutputBytes {
+		return data, nil
+	}
+
+	extra, err := c.readOutputPage(ctx, runID, maxRunOutputBytes, 1)
+	if err != nil {
+		return nil, err
+	}
+	if extra.Gap || extra.RetainedFrom > maxRunOutputBytes {
+		return nil, &Failure{Kind: KindProtocol, RunID: runID, Message: "Jinushi Run stdout changed while it was being read"}
+	}
+	if len(extra.Data) > base64.StdEncoding.EncodedLen(1) {
+		return nil, &Failure{Kind: KindProtocol, RunID: runID, Message: "Jinushi Run stdout changed while it was being read"}
+	}
+	more, err := base64.StdEncoding.DecodeString(extra.Data)
+	if err != nil {
+		return nil, &Failure{Kind: KindProtocol, RunID: runID, Message: "Jinushi Run stdout was not valid base64", Cause: err}
+	}
+	if len(more) > 1 {
+		return nil, &Failure{Kind: KindProtocol, RunID: runID, Message: "Jinushi Run stdout changed while it was being read"}
+	}
+	if len(more) != 0 {
+		return nil, &Failure{Kind: KindProtocol, RunID: runID, Message: "Jinushi Run stdout exceeds the endpoint evidence limit"}
+	}
+	return data, nil
+}
+
+func (c *Client) readOutputPage(ctx context.Context, runID string, offset, limit int) (response, error) {
+	argv := c.command("output",
+		"--json",
+		"--stream=stdout",
+		"--offset="+strconv.Itoa(offset),
+		"--limit="+strconv.Itoa(limit),
+		runID,
+	)
+	return c.call(ctx, argv, false)
+}
+
+func validRunID(runID string) bool {
+	if runID == "" || len(runID) > 128 {
+		return false
+	}
+	for _, char := range runID {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // Stop cancels the current Run using its freshly inspected generation and

@@ -97,12 +97,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var input struct {
-			EnvironmentID string   `json:"environmentId"`
-			ID            string   `json:"id"`
-			Argv          []string `json:"argv"`
-			CWD           string   `json:"cwd"`
-			Port          int      `json:"port"`
-			HealthPath    string   `json:"healthPath"`
+			EnvironmentID  string   `json:"environmentId"`
+			ID             string   `json:"id"`
+			Argv           []string `json:"argv"`
+			CWD            string   `json:"cwd"`
+			Port           int      `json:"port"`
+			ResolutionPath string   `json:"resolutionPath"`
+			HealthPath     string   `json:"healthPath"`
 		}
 		if !decodeRequest(r, &input) {
 			failure(w, 400, "invalid-request")
@@ -111,9 +112,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if input.HealthPath == "" {
 			input.HealthPath = "/"
 		}
+		endpoint := registry.Endpoint{ID: "ui", Label: "User interface", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: input.Port}
+		if input.ResolutionPath != "" {
+			endpoint.Resolution = &registry.EndpointResolution{Type: registry.EndpointResolutionJSONURLFile, Path: input.ResolutionPath}
+		}
 		service := registry.Service{ID: registry.ServiceID(input.ID), EnvironmentID: registry.EnvironmentID(input.EnvironmentID), DesiredState: registry.DesiredStopped,
 			Execution: registry.ExecutionIntent{Argv: input.Argv, CWD: input.CWD, Lifetime: registry.LifetimeDetached},
-			Endpoints: []registry.Endpoint{{ID: "ui", Label: "User interface", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: input.Port}},
+			Endpoints: []registry.Endpoint{endpoint},
 			Health:    registry.HealthDefinition{Type: registry.HealthHTTP, EndpointID: "ui", Path: input.HealthPath}}
 		if _, err := registry.NewSnapshot([]registry.Environment{{ID: registry.EnvironmentID(input.EnvironmentID), SSHHost: "validation"}}, []registry.Service{service}); err != nil {
 			failure(w, 400, "invalid-request")

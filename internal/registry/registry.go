@@ -102,11 +102,22 @@ func (h *HealthDefinition) UnmarshalJSON(data []byte) error {
 // host. RemoteAddress is restricted to the loopback target used by Matagi's
 // tunnel contract; local allocated ports are runtime state.
 type Endpoint struct {
-	ID            EndpointID `json:"id"`
-	Label         string     `json:"label"`
-	RemoteAddress string     `json:"remoteAddress"`
-	RemotePort    int        `json:"remotePort"`
+	ID            EndpointID          `json:"id"`
+	Label         string              `json:"label"`
+	RemoteAddress string              `json:"remoteAddress"`
+	RemotePort    int                 `json:"remotePort"`
+	Resolution    *EndpointResolution `json:"resolution,omitempty"`
 }
+
+// EndpointResolution describes a product-owned endpoint descriptor. The
+// descriptor path is registered per endpoint; runtime evidence from the
+// correlated Jinushi Run must agree with its URL before Matagi forwards it.
+type EndpointResolution struct {
+	Type string `json:"type"`
+	Path string `json:"path"`
+}
+
+const EndpointResolutionJSONURLFile = "json-url-file"
 
 type Service struct {
 	ID            ServiceID        `json:"id"`
@@ -198,8 +209,17 @@ func NewSnapshot(environments []Environment, services []Service) (*Snapshot, err
 			if endpoint.RemoteAddress != RemoteLoopbackAddress {
 				return nil, fmt.Errorf("endpoint %q in service %q must target remote loopback %s", endpoint.ID, service.ID, RemoteLoopbackAddress)
 			}
-			if endpoint.RemotePort < 1 || endpoint.RemotePort > 65535 {
-				return nil, fmt.Errorf("endpoint %q in service %q remote port must be between 1 and 65535", endpoint.ID, service.ID)
+			if endpoint.Resolution == nil {
+				if endpoint.RemotePort < 1 || endpoint.RemotePort > 65535 {
+					return nil, fmt.Errorf("endpoint %q in service %q remote port must be between 1 and 65535", endpoint.ID, service.ID)
+				}
+			} else {
+				if endpoint.RemotePort < 0 || endpoint.RemotePort > 65535 {
+					return nil, fmt.Errorf("endpoint %q in service %q has an invalid legacy remote port", endpoint.ID, service.ID)
+				}
+				if err := validateEndpointResolution(service.ID, endpoint.ID, *endpoint.Resolution); err != nil {
+					return nil, err
+				}
 			}
 		}
 		if _, exists := seenEndpoints[service.Health.EndpointID]; !exists {
@@ -216,6 +236,24 @@ func NewSnapshot(environments []Environment, services []Service) (*Snapshot, err
 		return services[a].ID < services[b].ID
 	})
 	return &Snapshot{environments: environments, services: services}, nil
+}
+
+func validateEndpointResolution(serviceID ServiceID, endpointID EndpointID, resolution EndpointResolution) error {
+	if resolution.Type != EndpointResolutionJSONURLFile {
+		return fmt.Errorf("endpoint %q in service %q has unsupported resolution type %q", endpointID, serviceID, resolution.Type)
+	}
+	if len(resolution.Path) == 0 || len(resolution.Path) > 512 || resolution.Path[0] != '/' {
+		return fmt.Errorf("endpoint %q in service %q resolution path must be an absolute remote path", endpointID, serviceID)
+	}
+	for _, char := range resolution.Path {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || strings.ContainsRune("/._-", char)) {
+			return fmt.Errorf("endpoint %q in service %q resolution path contains an unsupported character", endpointID, serviceID)
+		}
+	}
+	if strings.Contains(resolution.Path, "//") || strings.Contains(resolution.Path, "/../") || strings.HasSuffix(resolution.Path, "/..") || strings.Contains(resolution.Path, "/./") || strings.HasSuffix(resolution.Path, "/.") {
+		return fmt.Errorf("endpoint %q in service %q resolution path must be clean", endpointID, serviceID)
+	}
+	return nil
 }
 
 func validateExecution(serviceID ServiceID, execution ExecutionIntent) error {
@@ -315,6 +353,12 @@ func cloneServices(services []Service) []Service {
 		cloned[i].Execution.Argv = append([]string{}, service.Execution.Argv...)
 		cloned[i].Health = cloneHealth(service.Health)
 		cloned[i].Endpoints = append([]Endpoint{}, service.Endpoints...)
+		for endpointIndex := range cloned[i].Endpoints {
+			if service.Endpoints[endpointIndex].Resolution != nil {
+				resolution := *service.Endpoints[endpointIndex].Resolution
+				cloned[i].Endpoints[endpointIndex].Resolution = &resolution
+			}
+		}
 	}
 	return cloned
 }

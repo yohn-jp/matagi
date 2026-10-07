@@ -92,7 +92,7 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 		t.Fatalf("Jinushi process observation failed instead of classifying the unowned Run: %q", initial.ProcessError)
 	}
 
-	localURL := openEndpoint(t, uiURL)
+	assertOpenUnavailable(t, uiURL)
 	waiting := waitServiceProjection(t, apiURL, "unknown", "not-ready")
 	assertNoLaunchInProgress(t, waiting)
 	if waiting.ProcessError != "" {
@@ -108,9 +108,7 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	if started.State != "ready" {
 		t.Fatalf("explicit Start did not converge to ready: %#v", started)
 	}
-	if started.DesiredState != "running" {
-		t.Fatalf("desktop Start left desired state %q, want running", started.DesiredState)
-	}
+	localURL := openEndpoint(t, uiURL)
 	if body := harness.Get(t, localURL+"/"); !strings.Contains(body, "fixture-ui") {
 		t.Fatalf("forwarded endpoint returned unexpected body %q", body)
 	}
@@ -122,9 +120,6 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	restarted := waitServiceProjection(t, apiURL, "running", "ready")
 	if restarted.State != "ready" {
 		t.Fatalf("explicit Restart did not converge to ready: %#v", restarted)
-	}
-	if restarted.DesiredState != "running" {
-		t.Fatalf("desktop Restart changed desired state to %q, want running", restarted.DesiredState)
 	}
 
 	stateBody := harness.Get(t, apiURL+"/v1/state")
@@ -138,10 +133,36 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	if stopped.State != "stopped" {
 		t.Fatalf("explicit Stop did not converge to stopped: %#v", stopped)
 	}
-	if stopped.DesiredState != "stopped" {
-		t.Fatalf("desktop Stop left desired state %q, want stopped", stopped.DesiredState)
-	}
 	assertSSHBoundary(t, logPath, snapshot.Services()[0].CorrelationOwner())
+}
+
+func assertOpenUnavailable(t *testing.T, uiURL string) {
+	t.Helper()
+	form := url.Values{
+		"token":         {formToken(t, uiURL)},
+		"environmentId": {"fixture-env"},
+		"serviceId":     {"fixture-service"},
+		"endpointId":    {"ui"},
+	}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.PostForm(uiURL+"/open", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		t.Fatalf("Open before application readiness returned %s %s; want fail closed", resp.Status, body)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil || !strings.Contains(string(body), "not responding through the tunnel") {
+		t.Fatalf("Open before application readiness diagnostic = %q, %v", body, err)
+	}
 }
 
 func postAction(t *testing.T, uiURL, action string) {

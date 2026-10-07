@@ -129,7 +129,9 @@ func TestPollPreservesConfiguredReadinessTimeoutAndKeepsUIEndpointLazy(t *testin
 		if !ok {
 			t.Fatal("readiness request has no deadline")
 		}
-		remaining = time.Until(deadline)
+		if request.URL.Path == "/ready" {
+			remaining = time.Until(deadline)
+		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),

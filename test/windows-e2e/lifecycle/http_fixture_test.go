@@ -11,6 +11,10 @@ import (
 )
 
 func startRemoteHTTP(t *testing.T) (int, func()) {
+	return startRemoteHTTPWithBody(t, "fixture-ui")
+}
+
+func startRemoteHTTPWithBody(t *testing.T, uiBody string) (int, func()) {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -37,7 +41,7 @@ func startRemoteHTTP(t *testing.T) (int, func()) {
 		case "/healthz":
 			_, _ = io.WriteString(w, "ready")
 		default:
-			_, _ = io.WriteString(w, "fixture-ui")
+			_, _ = io.WriteString(w, uiBody)
 		}
 	})}
 	go func() { _ = server.Serve(listener) }()

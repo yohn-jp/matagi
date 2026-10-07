@@ -220,12 +220,22 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) addService(w http.ResponseWriter, r *http.Request) {
-	port, err := strconv.Atoi(r.PostForm.Get("port"))
-	if err != nil {
+	portText := strings.TrimSpace(r.PostForm.Get("port"))
+	resolutionPath := strings.TrimSpace(r.PostForm.Get("resolutionPath"))
+	port := 0
+	if portText != "" {
+		var err error
+		port, err = strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			h.index(w, r, h.locale().T("Enter a valid UI port (1–65535)."))
+			return
+		}
+	}
+	if port == 0 && resolutionPath == "" {
 		h.index(w, r, h.locale().T("Enter a valid UI port (1–65535)."))
 		return
 	}
-	req := AddServiceRequest{EnvironmentID: r.PostForm.Get("environmentId"), ID: strings.TrimSpace(r.PostForm.Get("service")), Argv: strings.Fields(r.PostForm.Get("command")), CWD: strings.TrimSpace(r.PostForm.Get("cwd")), Port: port, HealthPath: strings.TrimSpace(r.PostForm.Get("healthPath"))}
+	req := AddServiceRequest{EnvironmentID: r.PostForm.Get("environmentId"), ID: strings.TrimSpace(r.PostForm.Get("service")), Argv: strings.Fields(r.PostForm.Get("command")), CWD: strings.TrimSpace(r.PostForm.Get("cwd")), Port: port, ResolutionPath: resolutionPath, HealthPath: strings.TrimSpace(r.PostForm.Get("healthPath"))}
 	if req.ID == "" {
 		h.index(w, r, h.locale().T("The service name is required."))
 		return
@@ -278,6 +288,8 @@ func (h *handler) errorHint(code string) string {
 		message = "The environment or service is no longer registered. Refresh the workspace."
 	case "tunnel-unavailable":
 		message = "The endpoint could not be ensured. Check Jinushi, service readiness, and the tunnel status."
+	case "endpoint-unavailable":
+		message = "The application endpoint could not be resolved or reached. Check its descriptor, managed Run output, and service status."
 	default:
 		return ""
 	}
