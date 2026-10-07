@@ -321,6 +321,7 @@ func (r *Runtime) Stop(ctx context.Context, env, id string) (Service, error) {
 func (r *Runtime) Restart(ctx context.Context, env, id string) (Service, error) {
 	return r.mutate(ctx, env, id, "restart")
 }
+
 // updateDesiredState persists and publishes one lifecycle intent while the
 // runtime mutex is held. The observer is left intact because its probe targets
 // and runtime observations do not change when desired state changes.
