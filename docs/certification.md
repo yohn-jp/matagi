@@ -1,6 +1,6 @@
-# Issue #19 production certification
+# Issue #10 production certification
 
-Status: **REAL_HOST_CERTIFICATION_BLOCKED**. The implementation environment is Linux and does not have the user's Windows/WebView2 session or access to the development host. Portable tests are not Windows-to-host evidence. This document does not claim a successful run.
+Status: **REAL_HOST_CERTIFICATION_BLOCKED**. Issue #10 remains open. The implementation environment is Linux and does not have the user's Windows/WebView2 session or access to the development host. Portable tests are not Windows-to-host evidence. This document does not claim a successful run.
 
 A future candidate can be accepted only after recording all of the following from the **same exact production binary revision**:
 
@@ -15,4 +15,4 @@ A future candidate can be accepted only after recording all of the following fro
 - shutdown and restart evidence showing no Matagi tunnel leaks and no unrelated process termination;
 - CI/governance/security check links and exact SHA on which they passed.
 
-Do not substitute the repository's deterministic fixture SSH server or package tests for this real-host run. Do not mark Issue #19 complete without a successful candidate run.
+Do not substitute the repository's deterministic fixture SSH server or package tests for this real-host run. Do not mark Issue #10 complete without a successful candidate run.

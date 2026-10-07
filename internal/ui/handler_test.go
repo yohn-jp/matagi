@@ -6,10 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yohn-jp/matagi/internal/i18n"
+	"github.com/yohn-jp/matagi/internal/settings"
 )
 
 func TestHandlerRendersContractStateWithoutUnknownRuntimeData(t *testing.T) {
@@ -21,7 +25,7 @@ func TestHandlerRendersContractStateWithoutUnknownRuntimeData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(client, nil)
+	handler := testHandler(t, client, nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	if response.Code != http.StatusOK {
@@ -29,7 +33,7 @@ func TestHandlerRendersContractStateWithoutUnknownRuntimeData(t *testing.T) {
 	}
 	body := response.Body.String()
 	for _, want := range []string{
-		"dev", "Connection · SSH", "environment error", "Jinushi · supervisor", "running", "tone-ok", "prefers-color-scheme: light", "aria-busy", "live · 3 s", "setInterval(refresh,3000)", "Start", "Restart", "Stop",
+		"dev", "Connection · SSH", "environment error", "Jinushi · process supervisor", "Desired", "Process", "Readiness", "running", "tone-ok", "prefers-color-scheme: light", "aria-busy", "Live · updates every 3 seconds", "setInterval(refresh,3000)", "Start", "Restart", "Stop",
 		"process warning", "readiness warning", "Dashboard", "available", "Tunnel: ready", "Open",
 	} {
 		if !strings.Contains(body, want) {
@@ -43,6 +47,32 @@ func TestHandlerRendersContractStateWithoutUnknownRuntimeData(t *testing.T) {
 	}
 	if response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("security headers = %#v", response.Header())
+	}
+}
+
+func TestNewHandlerRemainsACompatibleHostLocaleConstructor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"version":1,"environments":[]}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(client, nil)
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Matagi") {
+		t.Fatalf("compatibility constructor = %d, %s", response.Code, response.Body.String())
+	}
+}
+
+func TestWorkspaceTemplateHasJapaneseCopyForEveryLiteralMessage(t *testing.T) {
+	messageID := regexp.MustCompile(`\{\{t \$?\.Locale "([^"]+)"`)
+	for _, match := range messageID.FindAllStringSubmatch(pageHTML, -1) {
+		if !i18n.Japanese.Has(match[1]) {
+			t.Errorf("workspace message %q has no Japanese catalog entry", match[1])
+		}
 	}
 }
 
@@ -61,8 +91,8 @@ func TestEmptyStateRegistrationSurfaceAndSubmission(t *testing.T) {
 	}))
 	defer server.Close()
 	client, _ := NewClient(server.URL, time.Second)
-	h := NewHandler(client, nil)
-	token := h.(*handler).token
+	h := testHandler(t, client, nil)
+	token := h.token
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
 	if !strings.Contains(w.Body.String(), "Connect a development environment") || strings.Contains(w.Body.String(), "registry JSON") || strings.Contains(w.Body.String(), "<textarea") {
@@ -72,6 +102,61 @@ func TestEmptyStateRegistrationSurfaceAndSubmission(t *testing.T) {
 	h.ServeHTTP(w, formRequest("POST", "/register", url.Values{"name": {"dev"}, "host": {"dev-host"}}, token))
 	if requests != 1 || w.Code != 303 {
 		t.Fatal(w.Code, requests)
+	}
+}
+
+func TestGenericServiceFormAndBoundedArgvRegistration(t *testing.T) {
+	var registered AddServiceRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/state":
+			fmt.Fprint(w, `{"version":1,"environments":[{"id":"dev","connectivity":"connected","jinushi":"ready","services":[]}]}`)
+		case "/v1/service/add":
+			if err := json.NewDecoder(r.Body).Decode(&registered); err != nil {
+				t.Errorf("decode service registration: %v", err)
+			}
+			fmt.Fprint(w, `{"version":1,"environments":[]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHandler(t, client, nil)
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.String()
+	for _, want := range []string{
+		"Service name", "Remote UI port", "Readiness path", "Working directory on the development host", "Start command and arguments", "Matagi does not parse shell quoting.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("generic service form lacks %q", want)
+		}
+	}
+	for _, product := range []string{"Yokodori", "Inari", "Hachidori", "yokodori serve"} {
+		if strings.Contains(pageHTML, product) {
+			t.Errorf("generic page includes sibling product copy %q", product)
+		}
+	}
+	form := url.Values{
+		"environmentId": {"dev"},
+		"service":       {"local-dashboard"},
+		"port":          {"43123"},
+		"healthPath":    {"/healthz"},
+		"cwd":           {"/srv/dashboard"},
+		"command":       {"python   -m http.server 8080"},
+	}
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/service/add", form, h.token))
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("service registration = %d, body=%s", response.Code, response.Body.String())
+	}
+	want := AddServiceRequest{EnvironmentID: "dev", ID: "local-dashboard", Argv: []string{"python", "-m", "http.server", "8080"}, CWD: "/srv/dashboard", Port: 43123, HealthPath: "/healthz"}
+	if registered.EnvironmentID != want.EnvironmentID || registered.ID != want.ID || registered.CWD != want.CWD || registered.Port != want.Port || registered.HealthPath != want.HealthPath || strings.Join(registered.Argv, "\x00") != strings.Join(want.Argv, "\x00") {
+		t.Fatalf("registered service = %#v, want %#v", registered, want)
 	}
 }
 
@@ -96,8 +181,8 @@ func TestHandlerLifecycleActionsSendOneMatchingRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(client, nil)
-	token := h.(*handler).token
+	h := testHandler(t, client, nil)
+	token := h.token
 	for _, action := range []string{"start", "stop", "restart"} {
 		form := url.Values{
 			"environmentId": {"dev"},
@@ -158,8 +243,8 @@ func TestHandlerEnsuresBeforeAdmittingAndRedirectingEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	admitter := &testAdmitter{ensured: &ensured}
-	h := NewHandler(client, admitter)
-	token := h.(*handler).token
+	h := testHandler(t, client, admitter)
+	token := h.token
 	form := url.Values{
 		"environmentId": {"dev"},
 		"serviceId":     {"svc"},
@@ -196,8 +281,8 @@ func TestHandlerDoesNotOpenUnavailableOrUnadmittedEndpoint(t *testing.T) {
 				t.Fatal(err)
 			}
 			admitter := &testAdmitter{err: test.admitterErr}
-			h := NewHandler(client, admitter)
-			token := h.(*handler).token
+			h := testHandler(t, client, admitter)
+			token := h.token
 			form := url.Values{"environmentId": {"dev"}, "serviceId": {"svc"}, "endpointId": {"dash"}}
 			response := httptest.NewRecorder()
 			h.ServeHTTP(response, formRequest(http.MethodPost, "/open", form, token))
@@ -219,7 +304,7 @@ func TestStateChangingFormsRequireTokenAndErrorPagesKeepSecurityHeaders(t *testi
 	}))
 	defer server.Close()
 	client, _ := NewClient(server.URL, time.Second)
-	h := NewHandler(client, nil)
+	h := testHandler(t, client, nil)
 
 	response := httptest.NewRecorder()
 	h.ServeHTTP(response, formRequest(http.MethodPost, "/register", url.Values{"name": {"dev"}, "host": {"host"}}, "wrong"))
@@ -231,9 +316,102 @@ func TestStateChangingFormsRequireTokenAndErrorPagesKeepSecurityHeaders(t *testi
 	}
 
 	response = httptest.NewRecorder()
-	h.(*handler).showError(response, http.StatusBadGateway, "failure")
+	h.showError(response, http.StatusBadGateway, "failure")
 	if response.Code != http.StatusBadGateway || response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("error response headers = %#v", response.Header())
+	}
+	if body := response.Body.String(); !strings.Contains(body, "Request could not be completed") || !strings.Contains(body, `href="/">Return to Workspace</a>`) || !strings.Contains(body, "Workspace status is unavailable.") || strings.Contains(body, "Loading the Matagi workspace") || strings.Contains(body, `id="sync-text"`) {
+		t.Fatalf("error page should offer a return without implying an endless load: %s", body)
+	}
+}
+
+func TestLocaleSelectionPersistsAndRendersCompleteJapaneseWorkspace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"version":1,"environments":[{"id":"dev","sshHost":"dev-host","connectivity":"connected","jinushi":"ready","services":[{"id":"svc","desiredState":"running","state":"ready","process":"running","readiness":"ready","processError":"process warning","readinessError":"","endpoints":[{"id":"ui","label":"Dashboard","endpointState":"available","tunnelState":"ready","localUrl":"http://127.0.0.1:43123/","failure":""}]}]}]}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := settings.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetLocale("en"); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandlerWithOptions(client, nil, Options{Settings: store}).(*handler)
+
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `<html lang="en">`) {
+		t.Fatalf("English workspace did not render: status=%d body=%s", response.Code, response.Body.String())
+	}
+	form := url.Values{"locale": {"ja"}, "returnTo": {"/updates"}}
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/settings/locale", form, h.token))
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/updates" {
+		t.Fatalf("locale POST = %d, Location=%q, body=%s", response.Code, response.Header().Get("Location"), response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.String()
+	for _, want := range []string{`<html lang="ja">`, "開発環境", "接続 · SSH", "目標状態", "プロセス", "準備状態", "開始", "Dashboard", "process warning", `name="environmentId"`, `name="serviceId"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("Japanese workspace lacks %q", want)
+		}
+	}
+	if !strings.Contains(body, "<h2>svc</h2>") || !strings.Contains(body, "dev-host") || !strings.Contains(body, `name="environmentId"`) || !strings.Contains(body, `name="serviceId"`) {
+		t.Error("service/environment identities or API field names were changed")
+	}
+	if !strings.Contains(body, `toLocaleTimeString(lang)`) || !strings.Contains(body, `"Live · updated ":"ライブ · 更新時刻 "`) {
+		t.Error("browser-generated operator copy did not use the page locale")
+	}
+	if got, err := store.Locale(); err != nil || got != "ja" {
+		t.Fatalf("saved locale = %q, %v", got, err)
+	}
+}
+
+func TestLocaleReturnPathIsRestrictedAndUnsupportedSelectionIsRejected(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"version":1,"environments":[]}`)
+	}))
+	defer server.Close()
+	client, _ := NewClient(server.URL, time.Second)
+	h := testHandler(t, client, nil)
+	form := url.Values{"locale": {"ja"}, "returnTo": {"https://example.invalid/"}}
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/settings/locale", form, h.token))
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/" {
+		t.Fatalf("unsafe return path = %d, %q", response.Code, response.Header().Get("Location"))
+	}
+	form.Set("locale", "fr")
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/settings/locale", form, h.token))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "English または 日本語を選択してください。") {
+		t.Fatalf("unsupported locale response = %d, %s", response.Code, response.Body.String())
+	}
+}
+
+func TestLifecycleActionConflictPreservesEvidenceAndDoesNotClaimNoChange(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"version":1,"error":{"code":"lifecycle-conflict","message":"submission-123"}}`, http.StatusConflict)
+	}))
+	defer server.Close()
+	client, _ := NewClient(server.URL, time.Second)
+	h := testHandler(t, client, nil)
+	form := url.Values{"environmentId": {"dev"}, "serviceId": {"svc"}, "action": {"start"}}
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/action", form, h.token))
+	body := response.Body.String()
+	for _, want := range []string{"lifecycle-conflict", "submission-123", "could not be confirmed", "inspect the managed process"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("action conflict lacks %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "No changes were saved.") {
+		t.Fatal("ambiguous lifecycle result was represented as no change")
 	}
 }
 
@@ -246,4 +424,16 @@ func formRequest(method, target string, form url.Values, token string) *http.Req
 	request := httptest.NewRequest(method, target, strings.NewReader(values.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return request
+}
+
+func testHandler(t *testing.T, client *Client, admitter EndpointAdmitter) *handler {
+	t.Helper()
+	store, err := settings.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetLocale("en"); err != nil {
+		t.Fatal(err)
+	}
+	return NewHandlerWithOptions(client, admitter, Options{Settings: store}).(*handler)
 }

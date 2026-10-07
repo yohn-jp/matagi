@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="{{.Locale}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>{{t .Locale "Updates"}} · Matagi</title>
+  <style>{{systemCSS}}</style>
+</head>
+<body>
+<a class="skip" href="#content">{{t .Locale "Skip to content"}}</a>
+<main class="shell flow" id="content">
+  <header class="mast updates-mast">
+    <div class="updates-heading">
+      <div class="updates-crumb"><a href="/">{{t .Locale "Workspace"}}</a><span aria-hidden="true">/</span><span aria-current="page">{{t .Locale "Updates"}}</span></div>
+      <h1>{{t .Locale "Updates"}}</h1>
+      <p class="lede">{{t .Locale "Manual, verified updates of the Matagi executable. Opening this page and changing the channel contact nothing; only Check for updates and Download use the network."}}</p>
+    </div>
+    <form class="locale-form btn-row" method="post" action="/settings/locale" id="ui-locale-form">
+      <input type="hidden" name="token" value="{{.Token}}">
+      <input type="hidden" name="returnTo" value="/updates">
+      <label class="vh" for="ui-locale">{{t .Locale "Language"}}</label>
+      <select id="ui-locale" name="locale">
+        <option value="en" {{if isLocale .Locale "en"}}selected{{end}}>English</option>
+        <option value="ja" {{if isLocale .Locale "ja"}}selected{{end}}>日本語</option>
+      </select>
+      <button class="btn quiet" type="submit" data-pending="{{t .Locale "Saving…"}}">{{t .Locale "Set language"}}</button>
+    </form>
+  </header>
+  {{if .Error}}<p class="msg bad feedback" role="alert"><strong>{{t .Locale .ErrorHint}}</strong> <span class="id">{{.Error}}</span></p>{{end}}
+  {{with .Upd}}
+  <div id="updates-region" class="flow">
+    {{if .Busy}}<p class="note updates-busy" id="updates-busy-note" role="status">{{t $.Locale "An update action is in progress. Check, Download, Save channel and Restart & update are unavailable until it finishes; progress is shown in Download and verification."}} <a href="#updates-op">{{t $.Locale "Show progress"}}</a></p>{{end}}
+
+    <section class="section" id="updates-installed" aria-labelledby="updates-installed-heading">
+      <div class="updates-section-heading"><h2 id="updates-installed-heading">{{t $.Locale "Installed"}}</h2></div>
+      <dl class="spec">
+        <div><dt>{{t $.Locale "Installed version"}}</dt><dd class="id" id="updates-installed-version">{{if .Installed.Known}}{{.Installed.Version}}{{else}}{{t $.Locale "unknown (identified by an explicit check)"}}{{end}}</dd></div>
+        {{with .Installed.SHA256}}<div><dt>{{t $.Locale "Executable SHA-256"}}</dt><dd class="id">{{.}}</dd></div>{{end}}
+        <div><dt>{{t $.Locale "Last check"}}</dt><dd id="updates-last-check">
+          {{with .LastCheck}}{{when .Time}} · {{t $.Locale (channelLabel .Channel)}} · {{if .OK}}{{if .Latest}}{{t $.Locale "latest"}} <span class="id">{{.Latest}}</span>{{else}}{{t $.Locale "No eligible releases on this channel."}}{{end}}{{else}}<span class="bad-t">{{t $.Locale "failed"}}: {{.Message}}</span>{{end}}{{else}}{{t $.Locale "never"}}{{end}}
+        </dd></div>
+      </dl>
+      <form method="post" action="/updates/channel" class="updates-channel" id="updates-channel">
+        <input type="hidden" name="token" value="{{$.Token}}">
+        <label class="field">{{t $.Locale "Update channel"}}
+          <select name="channel"{{if .Busy}} disabled{{end}}>
+            {{$selected := .Channel}}{{range .Channels}}<option value="{{.}}"{{if eq (printf "%s" .) (printf "%s" $selected)}} selected{{end}}>{{if eq (printf "%s" .) "stable"}}{{t $.Locale "Stable"}}{{else}}{{t $.Locale "Development"}}{{end}}</option>{{end}}
+          </select>
+        </label>
+        <button class="btn" type="submit" data-pending="{{t $.Locale "Saving…"}}"{{if .Busy}} disabled{{end}}>{{t $.Locale "Save channel"}}</button>
+      </form>
+      <p class="note prose">{{t $.Locale "Stable offers stable releases (X.Y.Z). Development offers development releases (X.Y.Z-dev) and stable releases. The channel only selects which releases an explicit check offers: it never downloads, installs or downgrades anything."}}</p>
+    </section>
+
+    <section class="section" id="updates-releases-section" aria-labelledby="updates-releases-heading">
+      <div class="updates-section-heading"><h2 id="updates-releases-heading">{{t $.Locale "Releases"}}</h2><span class="sub">{{t $.Locale "Official Matagi GitHub Releases"}}</span></div>
+      <form method="post" action="/updates/check" class="inline" id="updates-check">
+        <input type="hidden" name="token" value="{{$.Token}}">
+        <button class="btn primary" type="submit" data-pending="{{t $.Locale "Checking…"}}"{{if .Busy}} disabled{{end}}>{{t $.Locale "Check for updates"}}</button>
+      </form>
+      <p class="note">{{t $.Locale "Retrieves the release list from GitHub, only now. Results below stay until you check again, change the channel or restart Matagi."}}</p>
+      {{if and .LastCheck (not .LastCheck.OK)}}
+        <div class="updates-result tone-bad" role="alert" id="updates-check-failure">
+          <strong class="status">{{t $.Locale "FAILED"}}</strong><span class="id">{{.LastCheck.Message}}</span>
+          {{with $.Upd.CheckHint}}<p class="note">{{t $.Locale .}}</p>{{end}}
+          <p class="note">{{t $.Locale "Nothing was downloaded and the installed executable was not changed."}}</p>
+        </div>
+      {{end}}
+      {{with .Check}}
+        {{if .Releases}}
+          <p class="note" id="updates-results-note">{{t $.Locale "Checked"}} {{when .Time}} · {{t $.Locale "channel"}} {{t $.Locale (channelLabel .Channel)}}</p>
+          <div class="table-wrap">
+            <table class="data" id="updates-releases">
+              <thead><tr><th scope="col">{{t $.Locale "Release"}}</th><th scope="col">{{t $.Locale "Status"}}</th><th scope="col">{{t $.Locale "Published"}}</th><th scope="col">{{t $.Locale "Actions"}}</th></tr></thead>
+              <tbody>{{range .Releases}}
+                <tr>
+                  <td class="strong id">{{.Tag}}</td>
+                  <td>
+                    {{if eq .Relation "newer"}}<span class="badge tone-active">{{t $.Locale "newer"}}</span>
+                    {{else if eq .Relation "current"}}<span class="badge tone-ok">{{t $.Locale "installed"}}</span>
+                    {{else if eq .Relation "older"}}<span class="badge">{{t $.Locale "older"}}</span>
+                    {{else}}<span class="badge tone-warn">{{t $.Locale "not comparable"}}</span>{{end}}
+                    {{with .Problem}}<div class="bad-t">{{.}}</div><p class="note">{{t $.Locale "This release does not carry exactly one Windows executable and one checksum file. Choose another release or try again later."}}</p>{{end}}
+                    {{if eq .Relation "older"}}<div class="muted">{{t $.Locale "Not offered: an update never goes backwards."}}</div>{{end}}
+                  </td>
+                  <td>{{when .Published}}</td>
+                  <td class="nowrap">{{if .Downloadable}}
+                    <form method="post" action="/updates/download" class="inline updates-download-form" id="updates-download-{{.Tag}}">
+                      <input type="hidden" name="token" value="{{$.Token}}"><input type="hidden" name="tag" value="{{.Tag}}">
+                      <button class="btn" type="submit" data-pending="{{t $.Locale "Starting download…"}}"{{if $.Upd.Busy}} disabled{{end}}>{{t $.Locale "Download"}}</button>
+                    </form>
+                  {{end}}</td>
+                </tr>{{end}}
+              </tbody>
+            </table>
+          </div>
+          {{if not $.Upd.Installed.Known}}<p class="note">{{t $.Locale "The installed version is not known, so releases cannot be compared with it. Download only a release you intend to install."}}</p>{{end}}
+        {{else}}
+          <p class="note" id="updates-none">{{t $.Locale "Checked"}} {{when .Time}} · {{t $.Locale "No eligible releases on this channel."}}</p>
+        {{end}}
+      {{end}}
+    </section>
+
+    <section class="section" id="updates-op" aria-labelledby="updates-op-heading">
+      <div class="updates-section-heading"><h2 id="updates-op-heading">{{t $.Locale "Download and verification"}}</h2></div>
+      {{with .Op}}
+        <div class="updates-operation" id="updates-active-operation" aria-live="polite">
+          <div class="updates-operation-heading tone-active"><strong class="status">{{t $.Locale "RUNNING"}}</strong><span>{{t $.Locale (opLabel .Kind)}}</span>{{with .Tag}}<span class="id">{{.}}</span>{{end}}<time>{{when .Started}}</time></div>
+          {{if .Stages}}<ol class="stages">{{range .Stages}}<li class="{{.Status}}"><span>{{t $.Locale .Label}}</span><span class="sub">{{t $.Locale (stageWord .Status)}}</span></li>{{end}}</ol>{{end}}
+          {{if .Step}}
+            <p class="op-line">{{if .PhaseNumber}}{{t $.Locale "Phase %d of %d" .PhaseNumber .PhaseCount}} · {{end}}{{t $.Locale (stepLabel .Step)}} {{if .Detail}}<span class="id">{{.Detail}}</span>{{end}}{{if .Determinate}} · {{bytesIn .Done}} {{t $.Locale "of"}} {{bytesIn .Total}} ({{printf "%.0f" .Percent}}%){{else if and (eq .Step "downloading") .Done}} · {{bytesIn .Done}} {{t $.Locale "received (the server did not state a total size)"}}{{end}}</p>
+            {{if .Determinate}}<div class="bar progress" role="progressbar" aria-label="{{t $.Locale (stepLabel .Step)}}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{printf "%.0f" .Percent}}"><span style="width:{{printf "%.1f" .Percent}}%"></span></div>
+            {{else}}<div class="bar progress indeterminate" role="progressbar" aria-label="{{t $.Locale (stepLabel .Step)}}"><span></span></div>{{end}}
+          {{else}}
+            <p class="op-line">{{if .PhaseNumber}}{{t $.Locale "Phase %d of %d" .PhaseNumber .PhaseCount}} · {{end}}{{if .Phase}}{{t $.Locale "Working"}}{{else}}{{t $.Locale "Starting"}}{{end}}</p>
+            <div class="bar progress indeterminate" role="progressbar" aria-label="{{if .Phase}}{{t $.Locale "Working"}}{{else}}{{t $.Locale "Starting"}}{{end}}"><span></span></div>
+          {{end}}
+        </div>
+        <script>
+        (function () {
+          var timer = setInterval(function () {
+            if (document.hidden) return;
+            fetch(location.pathname, {cache: "no-store"}).then(function (r) { return r.ok ? r.text() : Promise.reject(r.status); }).then(function (html) {
+              var doc = new DOMParser().parseFromString(html, "text/html");
+              var src = doc.getElementById("updates-region"), dst = document.getElementById("updates-region");
+              if (!src || !dst) { clearInterval(timer); return; }
+              dst.replaceWith(src);
+              if (!src.querySelector("#updates-active-operation")) clearInterval(timer);
+            }).catch(function () {});
+          }, 1500);
+        })();
+        </script>
+      {{else}}{{with .LastOp}}
+        <div class="updates-operation-summary {{if .Failure}}tone-bad{{else}}tone-ok{{end}}" id="updates-last-operation" role="status">
+          <div class="updates-operation-heading"><strong class="status">{{if .Failure}}{{t $.Locale "FAILED"}}{{else}}{{t $.Locale "DONE"}}{{end}}</strong><span>{{t $.Locale (opLabel .Kind)}}</span>{{with .Tag}}<span class="id">{{.}}</span>{{end}}<time>{{when .Finished}}</time></div>
+          {{if .Failure}}<p class="op-line">{{t $.Locale "Failed in phase"}} {{t $.Locale (phaseLabel .Failure.Phase)}} · {{t $.Locale (stepLabel .Failure.Step)}}: <span class="id">{{.Failure.Message}}</span></p>
+            {{with $.Upd.OpOutcome}}<p class="note" id="updates-op-outcome">{{range .}}{{t $.Locale .}} {{end}}</p>{{end}}
+            {{with $.Upd.OpHint}}<p class="note" id="updates-op-hint">{{t $.Locale .}}</p>{{end}}
+          {{else if and $.Upd.Ready (not $.Upd.ReadyProblem)}}<p class="note" id="updates-op-next">{{t $.Locale "The update was downloaded and verified. Next: Restart & update, under Ready to install."}} <a href="#updates-ready">{{t $.Locale "Go to Ready to install"}}</a></p>{{end}}
+        </div>
+      {{else}}<p class="note">{{t $.Locale "No download in progress."}}</p>{{end}}{{end}}
+    </section>
+
+    <section class="section" id="updates-ready" aria-labelledby="updates-ready-heading">
+      <div class="updates-section-heading"><h2 id="updates-ready-heading">{{t $.Locale "Ready to install"}}</h2></div>
+      {{with .Ready}}
+        <dl class="spec">
+          <div><dt>{{t $.Locale "Release"}}</dt><dd class="id">{{.Tag}}</dd></div>
+          <div><dt>SHA-256</dt><dd class="id">{{.SHA256}}</dd></div>
+          <div><dt>{{t $.Locale "Verified"}}</dt><dd>{{t $.Locale "matches the release checksum"}} · {{when .Created}}</dd></div>
+          <div><dt>{{t $.Locale "Replaces"}}</dt><dd class="id">{{.Target}}</dd></div>
+        </dl>
+        {{if $.Upd.ReadyProblem}}<p class="msg bad" role="alert" id="updates-ready-problem"><strong>{{t $.Locale $.Upd.ReadyHint}}</strong> <span class="id">{{$.Upd.ReadyProblem}}</span></p>
+        {{else if not $.Upd.Supported}}<p class="note">{{t $.Locale "Restart & update is available only in the Windows desktop application."}}</p>
+        {{else}}
+          <form method="post" action="/updates/install" class="inline" id="updates-install" data-confirm="{{t $.Locale "Close Matagi, replace the executable and reopen it? Matagi-owned settings, registered environments and services remain stored."}}">
+            <input type="hidden" name="token" value="{{$.Token}}">
+            <button class="btn primary" type="submit" data-pending="{{t $.Locale "Restarting…"}}"{{if $.Upd.Busy}} disabled{{end}}>{{t $.Locale "Restart & update"}}</button>
+          </form>
+        {{end}}
+        <p class="note">{{t $.Locale "The executable is replaced by a separate helper after Matagi exits. If replacement fails, the previous executable is kept and reopened."}}</p>
+      {{else}}<p class="note" id="updates-not-ready">{{t $.Locale "Nothing downloaded and verified yet."}}</p>{{end}}
+    </section>
+
+    {{with .Result}}
+      <section class="section" id="updates-result" aria-labelledby="updates-result-heading">
+        <div class="updates-section-heading"><h2 id="updates-result-heading">{{t $.Locale "Last update attempt"}}</h2></div>
+        <div class="updates-result {{if eq .Outcome "applied"}}tone-ok{{else}}tone-bad{{end}}" role="status">
+          <strong class="status">{{if eq .Outcome "applied"}}{{t $.Locale "UPDATED"}}{{else if eq .Outcome "restart_failed"}}{{t $.Locale "RESTART FAILED"}}{{else}}{{t $.Locale "NOT UPDATED"}}{{end}}</strong>
+          <span class="id">{{.Tag}}</span><time>{{when .Time}}</time><span class="updates-result-message">{{.Message}}</span>
+        </div>
+        {{with $.Upd.ResultHint}}<p class="note">{{t $.Locale .}}</p>{{end}}
+      </section>
+    {{end}}
+    {{with .Err}}<p class="msg bad" role="alert" id="updates-state-error"><strong>{{t $.Locale $.Upd.StateHint}}</strong> <span class="id">{{.}}</span></p>{{end}}
+  </div>
+  {{end}}
+</main>
+<script>
+(function () {
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    if (form.getAttribute("aria-busy") === "true") { event.preventDefault(); return; }
+    var confirmation = form.dataset.confirm;
+    if (confirmation && !window.confirm(confirmation)) { event.preventDefault(); return; }
+    form.setAttribute("aria-busy", "true");
+    var button = event.submitter || form.querySelector("button[type=submit]");
+    if (button) {
+      button.setAttribute("aria-busy", "true");
+      if (button.dataset.pending) button.textContent = button.dataset.pending;
+    }
+  });
+  window.addEventListener("pageshow", function () {
+    document.querySelectorAll('[aria-busy="true"]').forEach(function (element) { element.removeAttribute("aria-busy"); });
+  });
+})();
+</script>
+</body>
+</html>

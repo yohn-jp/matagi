@@ -15,6 +15,7 @@ import (
 type fake struct {
 	action       string
 	env, svc, ep string
+	startErr     error
 }
 
 func (f *fake) Snapshot() runtime.State {
@@ -24,6 +25,9 @@ func (f *fake) Start(_ context.Context, e, s string) (runtime.Service, error) {
 	f.action = "start"
 	f.env = e
 	f.svc = s
+	if f.startErr != nil {
+		return runtime.Service{}, f.startErr
+	}
 	return runtime.Service{ID: s, Endpoints: []runtime.Endpoint{}}, nil
 }
 func (f *fake) Stop(_ context.Context, e, s string) (runtime.Service, error) {
@@ -73,6 +77,46 @@ func TestInvalidRequests(t *testing.T) {
 		if w.Code != 400 || !strings.Contains(w.Body.String(), `"code":"invalid-request"`) {
 			t.Fatal(w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestActionFailureKeepsStableClassAndBoundedJinushiEvidence(t *testing.T) {
+	f := &fake{startErr: &runtime.Failure{Code: "jinushi-command-failed", Evidence: "invalid-run"}}
+	w := httptest.NewRecorder()
+	New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/service/start", strings.NewReader(`{"environmentId":"e","serviceId":"s"}`)))
+	var response struct {
+		Version int `json:"version"`
+		Error   struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != 502 || response.Version != 1 || response.Error.Code != "jinushi-command-failed" || response.Error.Message != "invalid-run" {
+		t.Fatalf("action failure = status %d, %#v; want stable class plus literal Jinushi code", w.Code, response)
+	}
+}
+
+func TestActionFailureMapsTimeoutAndConflictStatuses(t *testing.T) {
+	for _, test := range []struct {
+		code string
+		want int
+	}{
+		{code: "ssh-timeout", want: 504},
+		{code: "jinushi-timeout", want: 504},
+		{code: "lifecycle-conflict", want: 409},
+		{code: "host-unreachable", want: 502},
+	} {
+		t.Run(test.code, func(t *testing.T) {
+			f := &fake{startErr: &runtime.Failure{Code: test.code}}
+			w := httptest.NewRecorder()
+			New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/service/start", strings.NewReader(`{"environmentId":"e","serviceId":"s"}`)))
+			if w.Code != test.want {
+				t.Fatalf("status = %d, want %d; response %s", w.Code, test.want, w.Body.String())
+			}
+		})
 	}
 }
 

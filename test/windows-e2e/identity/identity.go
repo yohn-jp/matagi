@@ -107,7 +107,7 @@ type Evidence struct {
 
 func RecordEvidence(path string, e Evidence) error { return write(path, e) }
 
-var Shards = []string{"startup", "surface", "transport", "lifecycle", "single-instance"}
+var Shards = []string{"startup", "surface", "transport", "lifecycle", "single-instance", "updates"}
 
 type Certification struct {
 	Source string `json:"source"`

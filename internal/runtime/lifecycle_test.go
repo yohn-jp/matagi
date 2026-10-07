@@ -38,11 +38,25 @@ func TestAmbiguousSubmissionAndRotation(t *testing.T) {
 		return ssh.Result{}, errors.New("unexpected command")
 	}
 	ctx := context.Background()
+	var started Service
 	for i := 0; i < 3; i++ {
-		_, err := r.Start(ctx, "env", "svc")
+		result, err := r.Start(ctx, "env", "svc")
 		if i < 2 && err == nil || i == 2 && err != nil {
 			t.Fatal(i, err)
 		}
+		if i == 2 {
+			started = result
+		}
+	}
+	if started.Process != "running" || started.State != "unknown" {
+		t.Fatalf("Start() result = %#v; want direct Jinushi process state with readiness still unknown", started)
+	}
+	snapshot := r.Snapshot()
+	if observed := snapshot.Environments[0].Services[0]; observed.Process != "running" || observed.State != "unknown" {
+		t.Fatalf("immediate runtime snapshot = %#v; want direct Jinushi process state without invented readiness", observed)
+	}
+	if environment := snapshot.Environments[0]; environment.Connectivity != "connected" || environment.Jinushi != "ready" {
+		t.Fatalf("immediate environment snapshot = %#v; successful Jinushi action did not refresh its authority state", environment)
 	}
 	if submissions[0] != submissions[1] || submissions[1] != submissions[2] || r.pending[key("env", "svc")] != "" {
 		t.Fatal(submissions)

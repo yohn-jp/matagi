@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -11,6 +14,7 @@ import (
 
 	"github.com/yohn-jp/matagi/internal/desktop"
 	"github.com/yohn-jp/matagi/internal/runtime"
+	"github.com/yohn-jp/matagi/internal/settings"
 )
 
 type fakeRuntime struct {
@@ -53,6 +57,9 @@ func (p fakePlatform) Open(ctx context.Context, w desktop.Window) error { return
 func (fakePlatform) ReportError(string, string)                         {}
 
 func TestProductionComposition(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("APPDATA", configDir)
 	rt := &fakeRuntime{}
 	p := fakePlatform{open: func(ctx context.Context, w desktop.Window) error {
 		if !w.Policy.AllowNavigation(w.URL) || w.Policy.AllowNavigation("https://example.com") || w.Policy.AllowNavigation("http://127.0.0.1:9/") {
@@ -63,9 +70,34 @@ func TestProductionComposition(t *testing.T) {
 		for {
 			resp, err := c.Get(w.URL)
 			if err == nil {
+				body, readErr := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				if resp.StatusCode != 200 {
+				if resp.StatusCode != 200 || readErr != nil {
 					t.Errorf("UI response: %d", resp.StatusCode)
+				}
+				const tokenMarker = `name="token" value="`
+				_, rest, found := strings.Cut(string(body), tokenMarker)
+				if !found {
+					return errors.New("production locale form has no token")
+				}
+				token, _, _ := strings.Cut(rest, `"`)
+				localized, err := c.PostForm(w.URL+"settings/locale", url.Values{"token": {token}, "locale": {"ja"}})
+				if err != nil {
+					return err
+				}
+				localizedBody, err := io.ReadAll(localized.Body)
+				localized.Body.Close()
+				if err != nil || localized.StatusCode != http.StatusOK || !strings.Contains(string(localizedBody), `lang="ja"`) {
+					return errors.New("production locale selection did not render Japanese")
+				}
+				updates, err := c.Get(w.URL + "updates")
+				if err != nil {
+					return err
+				}
+				updateBody, err := io.ReadAll(updates.Body)
+				updates.Body.Close()
+				if err != nil || updates.StatusCode != http.StatusOK || !strings.Contains(string(updateBody), `lang="ja"`) {
+					return errors.New("production updates surface did not use saved locale")
 				}
 				break
 			}
@@ -85,9 +117,19 @@ func TestProductionComposition(t *testing.T) {
 	if !rt.closed.Load() || !rt.running.Load() {
 		t.Fatal("runtime was not run and closed")
 	}
+	prefs, err := settings.NewStore(filepath.Join(configDir, "Matagi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	locale, err := prefs.Locale()
+	if err != nil || locale != "ja" {
+		t.Fatalf("saved locale after desktop shutdown = %q, %v", locale, err)
+	}
 }
 
 func TestProductionFailureClosesRuntime(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("APPDATA", t.TempDir())
 	rt := &fakeRuntime{fail: errors.New("runtime failed")}
 	p := fakePlatform{open: func(ctx context.Context, w desktop.Window) error { <-ctx.Done(); return nil }}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

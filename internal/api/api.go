@@ -47,6 +47,9 @@ func write(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 func failure(w http.ResponseWriter, status int, code string) {
+	failureWithMessage(w, status, code, code)
+}
+func failureWithMessage(w http.ResponseWriter, status int, code, message string) {
 	write(w, status, struct {
 		Version int `json:"version"`
 		Error   struct {
@@ -56,7 +59,7 @@ func failure(w http.ResponseWriter, status int, code string) {
 	}{Version: 1, Error: struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
-	}{code, code}})
+	}{code, message}})
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/environment/connect" && r.Method == http.MethodPost {
@@ -232,10 +235,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status = 400
 		case "lifecycle-conflict":
 			status = 409
-		case "timeout":
+		case "ssh-timeout", "jinushi-timeout":
 			status = 504
 		}
-		failure(w, status, code)
+		message := code
+		if errors.As(err, &f) && f.Evidence != "" {
+			message = f.Evidence
+		}
+		failureWithMessage(w, status, code, message)
 		return
 	}
 	if r.URL.Path == "/v1/endpoint/ensure" {
@@ -267,7 +274,11 @@ func operationFailure(w http.ResponseWriter, err error) {
 		if f.Code == "lifecycle-conflict" {
 			status = 409
 		}
-		failure(w, status, f.Code)
+		message := f.Code
+		if f.Evidence != "" {
+			message = f.Evidence
+		}
+		failureWithMessage(w, status, f.Code, message)
 		return
 	}
 	failure(w, 500, "registration-failed")

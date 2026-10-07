@@ -1,5 +1,5 @@
-// Package ui renders Matagi's desktop using Hachidori's shared visual-system
-// tokens and primitives for first run and the operational workspace.
+// Package ui renders Matagi's desktop using shared visual-system tokens and
+// primitives for first run and the operational workspace.
 package ui
 
 import (
