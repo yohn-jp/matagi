@@ -321,6 +321,52 @@ func (r *Runtime) Stop(ctx context.Context, env, id string) (Service, error) {
 func (r *Runtime) Restart(ctx context.Context, env, id string) (Service, error) {
 	return r.mutate(ctx, env, id, "restart")
 }
+// updateDesiredState persists and publishes one lifecycle intent while the
+// runtime mutex is held. The observer is left intact because its probe targets
+// and runtime observations do not change when desired state changes.
+func (r *Runtime) updateDesiredState(s registry.Service, desired registry.DesiredState) (registry.Service, error) {
+	if s.DesiredState == desired {
+		return s, nil
+	}
+
+	services := r.registry.Services()
+	found := false
+	for i := range services {
+		if services[i].EnvironmentID == s.EnvironmentID && services[i].ID == s.ID {
+			services[i].DesiredState = desired
+			found = true
+			break
+		}
+	}
+	if !found {
+		return registry.Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+
+	candidate, err := registry.NewSnapshot(r.registry.Environments(), services)
+	if err != nil {
+		return registry.Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	var updated registry.Service
+	for _, service := range candidate.Services() {
+		if service.EnvironmentID == s.EnvironmentID && service.ID == s.ID {
+			updated = service
+			break
+		}
+	}
+	if updated.ID == "" {
+		return registry.Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	if r.store != nil {
+		if err := r.store.Save(candidate); err != nil {
+			return registry.Service{}, &Failure{Code: "lifecycle-conflict", Evidence: "desired service state could not be saved after the Jinushi operation succeeded"}
+		}
+	}
+
+	r.registry = candidate
+	r.services[key(string(updated.EnvironmentID), string(updated.ID))] = updated
+	return updated, nil
+}
+
 func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -362,10 +408,23 @@ func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, 
 		}
 		return Service{}, classify(err)
 	}
-	r.jinushi[env] = "ready"
+	if action != "stop" {
+		if _, stateErr := processState(run); stateErr != nil {
+			return Service{}, &Failure{Code: "lifecycle-conflict"}
+		}
+	}
 	if action == "stop" || run.ID != "" {
 		delete(r.pending, key(env, id))
 	}
+	desired := registry.DesiredRunning
+	if action == "stop" {
+		desired = registry.DesiredStopped
+	}
+	s, err = r.updateDesiredState(s, desired)
+	if err != nil {
+		return Service{}, err
+	}
+	r.jinushi[env] = "ready"
 	if action == "stop" {
 		for _, ep := range s.Endpoints {
 			identity := tunnel.Identity{Environment: env, Service: id, Endpoint: string(ep.ID)}
