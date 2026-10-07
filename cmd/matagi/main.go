@@ -16,7 +16,9 @@ import (
 	"github.com/yohn-jp/matagi/internal/api"
 	"github.com/yohn-jp/matagi/internal/config"
 	"github.com/yohn-jp/matagi/internal/desktop"
+	"github.com/yohn-jp/matagi/internal/i18n"
 	"github.com/yohn-jp/matagi/internal/runtime"
+	"github.com/yohn-jp/matagi/internal/settings"
 	"github.com/yohn-jp/matagi/internal/ui"
 )
 
@@ -32,14 +34,30 @@ func main() {
 	}
 	if err := runProduct(); err != nil {
 		fmt.Fprintln(os.Stderr, "matagi:", err)
-		if goruntime.GOOS == "windows" {
-			desktop.Native().ReportError("Matagi could not start", err.Error())
+		if goruntime.GOOS == "windows" && !(len(os.Args) > 1 && os.Args[1] == "apply-update") {
+			locale := i18n.Resolve("", i18n.HostLocales()...)
+			if root, stateErr := config.UserStateRoot(); stateErr == nil {
+				if prefs, settingsErr := settings.NewStore(root); settingsErr == nil {
+					if saved, localeErr := prefs.Locale(); localeErr == nil {
+						locale = i18n.Resolve(string(saved), i18n.HostLocales()...)
+					}
+				}
+			}
+			desktop.Native().ReportError(locale.T("Matagi could not start"), err.Error())
 		}
 		os.Exit(1)
 	}
 }
 
 func runProduct() error {
+	// The verified replacement helper must run without acquiring the desktop
+	// instance: it waits for that instance to exit before replacing its file.
+	if len(os.Args) > 1 {
+		if os.Args[1] == "apply-update" {
+			return cmdApplyUpdate(os.Args[2:])
+		}
+		return fmt.Errorf("unknown command %q", os.Args[1])
+	}
 	if goruntime.GOOS == "windows" {
 		platform := desktop.Native()
 		_, release, err := desktop.Preflight(platform)
@@ -128,8 +146,17 @@ func runDesktop(parent context.Context, rt lifecycle, platform desktop.Platform)
 	if err != nil {
 		return closeRuntime(rt, err)
 	}
+	stateRoot, err := config.UserStateRoot()
+	if err != nil {
+		return closeRuntime(rt, err)
+	}
+	prefs, err := settings.NewStore(stateRoot)
+	if err != nil {
+		return closeRuntime(rt, err)
+	}
+	updates := newDesktopUpdates(stateRoot, prefs, stop)
 	apiServer := &http.Server{Handler: api.New(rt), ReadHeaderTimeout: 5 * time.Second}
-	uiServer := &http.Server{Handler: ui.NewHandler(client, policy), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 15 * time.Second}
+	uiServer := &http.Server{Handler: ui.NewHandlerWithOptions(client, policy, ui.Options{Settings: prefs, Updates: updates}), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 15 * time.Second}
 	results := make(chan error, 3)
 	go func() { results <- rt.Run(ctx) }()
 	go func() {
@@ -163,6 +190,7 @@ func runDesktop(parent context.Context, rt lifecycle, platform desktop.Platform)
 	case result = <-windowDone:
 		remainingWindow = false
 	case <-parent.Done():
+	case <-ctx.Done():
 	}
 	stop()
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
