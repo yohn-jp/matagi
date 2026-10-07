@@ -752,7 +752,8 @@ func (s *Service) fetchExecutable(op *Operation, c Candidate, dst string) (strin
 	}
 	h := sha256.New()
 	pr := &progressWriter{s: s, op: op, total: c.Exe.Size}
-	n, err := io.Copy(io.MultiWriter(f, h, pr), stallReader{resp.Body, watchdog})
+	limited := io.LimitReader(stallReader{resp.Body, watchdog}, c.Exe.Size+1)
+	n, err := io.Copy(io.MultiWriter(f, h, pr), limited)
 	if err == nil {
 		err = f.Sync()
 	}

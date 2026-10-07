@@ -2,6 +2,7 @@ package update
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -360,6 +361,35 @@ func TestChecksumDigestFromMetadataMustAgree(t *testing.T) {
 	op := e.download("0.1.5-dev")
 	if op.Failure == nil || op.Failure.Class != ClassVerification {
 		t.Fatalf("%+v", op)
+	}
+}
+
+func TestDownloadBoundsUnknownLengthExecutableToDeclaredSizePlusOne(t *testing.T) {
+	e := newEnv(t)
+	e.svc.SetChannel(Development)
+	e.catalog("0.1.5-dev")
+	e.check()
+
+	tag := "0.1.5-dev"
+	declaredSize := len(e.g.blobs[tag+"/"+ExeAsset])
+	e.g.blobs[tag+"/"+ExeAsset] = append(e.g.blobs[tag+"/"+ExeAsset], make([]byte, 1<<20)...)
+	transport := &unknownLengthExecutable{next: e.g}
+	e.svc.Transport = transport
+	op := e.download(tag)
+	if op == nil || op.Failure == nil || op.Failure.Class != ClassDownload {
+		t.Fatalf("oversized executable was not rejected: %+v", op)
+	}
+	if transport.body == nil || transport.body.read != int64(declaredSize+1) {
+		t.Fatalf("download read %v bytes, want at most declared size plus one (%d)", transport.body, declaredSize+1)
+	}
+	if _, err := os.Stat(StagedPath(e.root, mustVersion(tag)) + ".part"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("partial file remains after size failure: %v", err)
+	}
+	if st := e.svc.Status(); st.Ready != nil {
+		t.Errorf("oversized download became ready: %+v", st.Ready)
+	}
+	if got, err := os.ReadFile(e.exe); err != nil || string(got) != string(e.exeData) {
+		t.Errorf("installed executable changed: %q, %v", got, err)
 	}
 }
 

@@ -32,6 +32,39 @@ type fakeGitHub struct {
 	apiRedir   string
 }
 
+// unknownLengthExecutable presents the executable body as chunked and records
+// how much the updater consumes. It verifies the release metadata size bounds
+// the transfer when Content-Length cannot do so.
+type unknownLengthExecutable struct {
+	next http.RoundTripper
+	body *countedReadCloser
+}
+
+func (t *unknownLengthExecutable) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.next.RoundTrip(req)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	if req.URL.Host == "objects.githubusercontent.com" && strings.HasSuffix(req.URL.Path, "/"+ExeAsset) && resp.StatusCode == http.StatusOK {
+		resp.ContentLength = -1
+		resp.Header.Del("Content-Length")
+		t.body = &countedReadCloser{ReadCloser: resp.Body}
+		resp.Body = t.body
+	}
+	return resp, nil
+}
+
+type countedReadCloser struct {
+	io.ReadCloser
+	read int64
+}
+
+func (r *countedReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.read += int64(n)
+	return n, err
+}
+
 func newFake(t *testing.T) *fakeGitHub {
 	return &fakeGitHub{t: t, pages: map[int]string{}, blobs: map[string][]byte{}, status: map[string]int{}, redirectTo: map[string]string{}}
 }
