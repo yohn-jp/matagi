@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -209,33 +208,6 @@ func formToken(t *testing.T, uiURL string) string {
 		t.Fatalf("unexpected form token length %d", len(token))
 	}
 	return token
-}
-
-func startRemoteHTTP(t *testing.T) (int, func()) {
-	t.Helper()
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ready := make(chan struct{})
-	var once sync.Once
-	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-ready:
-		default:
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
-			return
-		}
-		switch r.URL.Path {
-		case "/healthz":
-			_, _ = io.WriteString(w, "ready")
-		default:
-			_, _ = io.WriteString(w, "fixture-ui")
-		}
-	})}
-	go func() { _ = server.Serve(listener) }()
-	t.Cleanup(func() { _ = server.Close() })
-	return listener.Addr().(*net.TCPAddr).Port, func() { once.Do(func() { close(ready) }) }
 }
 
 func waitUnreachable(t *testing.T, rawURL string) {
