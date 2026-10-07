@@ -12,6 +12,7 @@
 details { padding: var(--sp-2) 0; }
 summary { cursor: pointer; color: var(--text-2); }
 .updates-heading { display: grid; gap: var(--sp-2); min-width: 0; }
+.updates-mast { align-items: flex-start; flex-wrap: wrap; }
 .updates-crumb { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); color: var(--text-3); font-size: var(--fs-small); }
 .updates-crumb a { color: var(--text-2); text-decoration: none; }
 .updates-crumb a:hover { color: var(--text); text-decoration: underline; }

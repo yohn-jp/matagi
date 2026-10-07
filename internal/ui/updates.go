@@ -68,13 +68,14 @@ var updatesTemplate = template.Must(template.New("updates").Funcs(updatesTemplat
 
 func updatesTemplateFuncs() template.FuncMap {
 	funcs := template.FuncMap{
-		"systemCSS":  CSS,
-		"when":       updateTime,
-		"bytesIn":    updateBytes,
-		"phaseLabel": updatePhaseLabel,
-		"stepLabel":  updateStepLabel,
-		"stageWord":  updateStageWord,
-		"opLabel":    updateOperationLabel,
+		"systemCSS":    CSS,
+		"when":         updateTime,
+		"bytesIn":      updateBytes,
+		"channelLabel": updateChannelLabel,
+		"phaseLabel":   updatePhaseLabel,
+		"stepLabel":    updateStepLabel,
+		"stageWord":    updateStageWord,
+		"opLabel":      updateOperationLabel,
 	}
 	for name, fn := range templateFuncs() {
 		funcs[name] = fn
@@ -157,6 +158,17 @@ func indexOf(values []string, want string) int {
 		}
 	}
 	return -1
+}
+
+func updateChannelLabel(channel update.Channel) string {
+	switch channel {
+	case update.Stable:
+		return "Stable"
+	case update.Development:
+		return "Development"
+	default:
+		return string(channel)
+	}
 }
 
 func updatePhaseLabel(phase string) string {

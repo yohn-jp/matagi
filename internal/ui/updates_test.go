@@ -128,12 +128,109 @@ func TestUpdatesPageRendersLocalStateInEnglishAndJapanese(t *testing.T) {
 				t.Errorf("%s update UI contains sibling product text %q", locale, forbidden)
 			}
 		}
+		localeFormID := strings.Index(body, `id="ui-locale-form"`)
+		if localeFormID < 0 {
+			t.Fatalf("%s update page lacks its locale form", locale)
+		}
+		localeFormStart := strings.LastIndex(body[:localeFormID], "<form")
+		if localeFormStart < 0 {
+			t.Fatalf("%s update page lacks its locale form", locale)
+		}
+		localeFormEnd := strings.Index(body[localeFormStart:], "</form>")
+		if localeFormEnd < 0 {
+			t.Fatalf("%s update page lacks its locale form", locale)
+		}
+		localeForm := body[localeFormStart : localeFormStart+localeFormEnd]
+		for _, want := range []string{
+			`action="/settings/locale"`,
+			`name="token" value="` + h.token + `"`,
+			`name="returnTo" value="/updates"`,
+			`id="ui-locale"`,
+			`name="locale"`,
+			`value="en"`,
+			`value="ja"`,
+			`value="` + string(locale) + `" selected`,
+		} {
+			if !strings.Contains(localeForm, want) {
+				t.Errorf("%s locale form lacks %q", locale, want)
+			}
+		}
 		if !strings.Contains(body, `action="/updates/check"`) || !strings.Contains(body, `action="/updates/download"`) || !strings.Contains(body, `id="updates-install"`) {
 			t.Errorf("%s page lacks explicit update actions", locale)
 		}
 	}
 	if f.checks != 0 || len(f.downloads) != 0 || f.installs != 0 || len(f.channels) != 0 {
 		t.Fatalf("rendering performed an update action: checks=%d downloads=%v installs=%d channels=%v", f.checks, f.downloads, f.installs, f.channels)
+	}
+}
+
+func TestUpdatesPageLocalizesChannelLabelsAndRetainsChannelEnums(t *testing.T) {
+	for _, item := range []struct {
+		channel update.Channel
+		label   string
+	}{
+		{channel: update.Stable, label: "Stable"},
+		{channel: update.Development, label: "Development"},
+	} {
+		status := baseUpdatesStatus(t)
+		status.Channel = item.channel
+		status.LastCheck.Channel = item.channel
+		status.Check.Channel = item.channel
+		f := &fakeUIUpdates{status: status}
+		h, store := newUpdatesTestHandler(t, f, i18n.English)
+		for _, locale := range []i18n.Locale{i18n.English, i18n.Japanese} {
+			if err := store.SetLocale(string(locale)); err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/updates", nil))
+			body := response.Body.String()
+			lastStart := strings.Index(body, `id="updates-last-check">`)
+			if lastStart < 0 {
+				t.Fatalf("%s page lacks the last-check channel", locale)
+			}
+			lastEnd := strings.Index(body[lastStart:], "</dd>")
+			if lastEnd < 0 {
+				t.Fatalf("%s page lacks the last-check channel", locale)
+			}
+			lastCheck := body[lastStart : lastStart+lastEnd]
+			if !strings.Contains(lastCheck, locale.T(item.label)) || strings.Contains(lastCheck, "· "+string(item.channel)+" ·") {
+				t.Errorf("%s last-check channel is not localized: %s", locale, lastCheck)
+			}
+			resultsStart := strings.Index(body, `id="updates-results-note">`)
+			if resultsStart < 0 {
+				t.Fatalf("%s page lacks the check-result channel", locale)
+			}
+			resultsEnd := strings.Index(body[resultsStart:], "</p>")
+			if resultsEnd < 0 {
+				t.Fatalf("%s page lacks the check-result channel", locale)
+			}
+			resultsNote := body[resultsStart : resultsStart+resultsEnd]
+			if !strings.Contains(resultsNote, locale.T(item.label)) || strings.Contains(resultsNote, locale.T("channel")+" "+string(item.channel)) {
+				t.Errorf("%s result channel is not localized: %s", locale, resultsNote)
+			}
+			if !strings.Contains(body, `value="`+string(item.channel)+`" selected`) {
+				t.Errorf("%s page changed the updater's channel enum %q", locale, item.channel)
+			}
+		}
+	}
+}
+
+func TestUpdatesPageExplainsReleaseAssetProblemsInBothLocales(t *testing.T) {
+	status := baseUpdatesStatus(t)
+	status.Check.Releases[0].Problem = "two Windows executable assets were found"
+	h, store := newUpdatesTestHandler(t, &fakeUIUpdates{status: status}, i18n.English)
+	for _, locale := range []i18n.Locale{i18n.English, i18n.Japanese} {
+		if err := store.SetLocale(string(locale)); err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/updates", nil))
+		body := response.Body.String()
+		hint := update.Hints[update.ClassAsset]
+		if !strings.Contains(body, locale.T(hint)) || !strings.Contains(body, "two Windows executable assets were found") {
+			t.Errorf("%s page lacks localized asset guidance or literal evidence: %s", locale, body)
+		}
 	}
 }
 

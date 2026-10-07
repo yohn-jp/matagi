@@ -10,12 +10,22 @@
 <body>
 <a class="skip" href="#content">{{t .Locale "Skip to content"}}</a>
 <main class="shell flow" id="content">
-  <header class="mast">
+  <header class="mast updates-mast">
     <div class="updates-heading">
       <div class="updates-crumb"><a href="/">{{t .Locale "Workspace"}}</a><span aria-hidden="true">/</span><span aria-current="page">{{t .Locale "Updates"}}</span></div>
       <h1>{{t .Locale "Updates"}}</h1>
       <p class="lede">{{t .Locale "Manual, verified updates of the Matagi executable. Opening this page and changing the channel contact nothing; only Check for updates and Download use the network."}}</p>
     </div>
+    <form class="locale-form btn-row" method="post" action="/settings/locale" id="ui-locale-form">
+      <input type="hidden" name="token" value="{{.Token}}">
+      <input type="hidden" name="returnTo" value="/updates">
+      <label class="vh" for="ui-locale">{{t .Locale "Language"}}</label>
+      <select id="ui-locale" name="locale">
+        <option value="en" {{if isLocale .Locale "en"}}selected{{end}}>English</option>
+        <option value="ja" {{if isLocale .Locale "ja"}}selected{{end}}>日本語</option>
+      </select>
+      <button class="btn quiet" type="submit" data-pending="{{t .Locale "Saving…"}}">{{t .Locale "Set language"}}</button>
+    </form>
   </header>
   {{if .Error}}<p class="msg bad feedback" role="alert"><strong>{{t .Locale .ErrorHint}}</strong> <span class="id">{{.Error}}</span></p>{{end}}
   {{with .Upd}}
@@ -28,7 +38,7 @@
         <div><dt>{{t $.Locale "Installed version"}}</dt><dd class="id" id="updates-installed-version">{{if .Installed.Known}}{{.Installed.Version}}{{else}}{{t $.Locale "unknown (identified by an explicit check)"}}{{end}}</dd></div>
         {{with .Installed.SHA256}}<div><dt>{{t $.Locale "Executable SHA-256"}}</dt><dd class="id">{{.}}</dd></div>{{end}}
         <div><dt>{{t $.Locale "Last check"}}</dt><dd id="updates-last-check">
-          {{with .LastCheck}}{{when .Time}} · {{.Channel}} · {{if .OK}}{{if .Latest}}{{t $.Locale "latest"}} <span class="id">{{.Latest}}</span>{{else}}{{t $.Locale "No eligible releases on this channel."}}{{end}}{{else}}<span class="bad-t">{{t $.Locale "failed"}}: {{.Message}}</span>{{end}}{{else}}{{t $.Locale "never"}}{{end}}
+          {{with .LastCheck}}{{when .Time}} · {{t $.Locale (channelLabel .Channel)}} · {{if .OK}}{{if .Latest}}{{t $.Locale "latest"}} <span class="id">{{.Latest}}</span>{{else}}{{t $.Locale "No eligible releases on this channel."}}{{end}}{{else}}<span class="bad-t">{{t $.Locale "failed"}}: {{.Message}}</span>{{end}}{{else}}{{t $.Locale "never"}}{{end}}
         </dd></div>
       </dl>
       <form method="post" action="/updates/channel" class="updates-channel" id="updates-channel">
@@ -59,7 +69,7 @@
       {{end}}
       {{with .Check}}
         {{if .Releases}}
-          <p class="note" id="updates-results-note">{{t $.Locale "Checked"}} {{when .Time}} · {{t $.Locale "channel"}} {{.Channel}}</p>
+          <p class="note" id="updates-results-note">{{t $.Locale "Checked"}} {{when .Time}} · {{t $.Locale "channel"}} {{t $.Locale (channelLabel .Channel)}}</p>
           <div class="table-wrap">
             <table class="data" id="updates-releases">
               <thead><tr><th scope="col">{{t $.Locale "Release"}}</th><th scope="col">{{t $.Locale "Status"}}</th><th scope="col">{{t $.Locale "Published"}}</th><th scope="col">{{t $.Locale "Actions"}}</th></tr></thead>
@@ -71,7 +81,7 @@
                     {{else if eq .Relation "current"}}<span class="badge tone-ok">{{t $.Locale "installed"}}</span>
                     {{else if eq .Relation "older"}}<span class="badge">{{t $.Locale "older"}}</span>
                     {{else}}<span class="badge tone-warn">{{t $.Locale "not comparable"}}</span>{{end}}
-                    {{with .Problem}}<div class="bad-t">{{.}}</div>{{end}}
+                    {{with .Problem}}<div class="bad-t">{{.}}</div><p class="note">{{t $.Locale "This release does not carry exactly one Windows executable and one checksum file. Choose another release or try again later."}}</p>{{end}}
                     {{if eq .Relation "older"}}<div class="muted">{{t $.Locale "Not offered: an update never goes backwards."}}</div>{{end}}
                   </td>
                   <td>{{when .Published}}</td>
