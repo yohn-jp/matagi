@@ -108,6 +108,9 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	if started.State != "ready" {
 		t.Fatalf("explicit Start did not converge to ready: %#v", started)
 	}
+	if started.DesiredState != "running" {
+		t.Fatalf("desktop Start left desired state %q, want running", started.DesiredState)
+	}
 	if body := harness.Get(t, localURL+"/"); !strings.Contains(body, "fixture-ui") {
 		t.Fatalf("forwarded endpoint returned unexpected body %q", body)
 	}
@@ -120,6 +123,9 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	if restarted.State != "ready" {
 		t.Fatalf("explicit Restart did not converge to ready: %#v", restarted)
 	}
+	if restarted.DesiredState != "running" {
+		t.Fatalf("desktop Restart changed desired state to %q, want running", restarted.DesiredState)
+	}
 
 	stateBody := harness.Get(t, apiURL+"/v1/state")
 	if !strings.Contains(stateBody, `"fixture-service"`) {
@@ -131,6 +137,9 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	stopped := waitServiceProjection(t, apiURL, "stopped", "unknown")
 	if stopped.State != "stopped" {
 		t.Fatalf("explicit Stop did not converge to stopped: %#v", stopped)
+	}
+	if stopped.DesiredState != "stopped" {
+		t.Fatalf("desktop Stop left desired state %q, want stopped", stopped.DesiredState)
 	}
 	assertSSHBoundary(t, logPath, snapshot.Services()[0].CorrelationOwner())
 }
