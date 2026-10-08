@@ -137,7 +137,11 @@ func runDesktop(parent context.Context, rt lifecycle, platform desktop.Platform)
 		return closeRuntime(rt, fmt.Errorf("binding UI: %w", err))
 	}
 	defer uiListener.Close()
-	client, err := ui.NewClient("http://"+apiListener.Addr().String(), 30*time.Second)
+	capability, err := api.NewCapability(apiListener.Addr().String())
+	if err != nil {
+		return closeRuntime(rt, fmt.Errorf("creating API capability: %w", err))
+	}
+	client, err := ui.NewClientWithCapability("http://"+apiListener.Addr().String(), 30*time.Second, capability)
 	if err != nil {
 		return closeRuntime(rt, err)
 	}
@@ -155,7 +159,7 @@ func runDesktop(parent context.Context, rt lifecycle, platform desktop.Platform)
 		return closeRuntime(rt, err)
 	}
 	updates := newDesktopUpdates(stateRoot, prefs, stop)
-	apiServer := &http.Server{Handler: api.New(rt), ReadHeaderTimeout: 5 * time.Second}
+	apiServer := &http.Server{Handler: api.NewWithCapability(rt, capability), ReadHeaderTimeout: 5 * time.Second}
 	uiServer := &http.Server{Handler: ui.NewHandlerWithOptions(client, policy, ui.Options{Settings: prefs, Updates: updates}), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 15 * time.Second}
 	results := make(chan error, 3)
 	go func() { results <- rt.Run(ctx) }()

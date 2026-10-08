@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -12,7 +13,29 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yohn-jp/matagi/internal/api"
+	"github.com/yohn-jp/matagi/internal/runtime"
 )
+
+type compatibilityRuntime struct{ starts int }
+
+func (*compatibilityRuntime) Snapshot() runtime.State {
+	return runtime.State{Version: 1, Environments: []runtime.Environment{}}
+}
+func (r *compatibilityRuntime) Start(context.Context, string, string) (runtime.Service, error) {
+	r.starts++
+	return runtime.Service{}, nil
+}
+func (*compatibilityRuntime) Stop(context.Context, string, string) (runtime.Service, error) {
+	return runtime.Service{}, nil
+}
+func (*compatibilityRuntime) Restart(context.Context, string, string) (runtime.Service, error) {
+	return runtime.Service{}, nil
+}
+func (*compatibilityRuntime) Ensure(context.Context, string, string, string) (runtime.Endpoint, error) {
+	return runtime.Endpoint{}, nil
+}
 
 func TestClientImplementsFrozenV1RoutesAndBodies(t *testing.T) {
 	var mu sync.Mutex
@@ -177,6 +200,90 @@ func TestClientDoesNotReplayMutationAfterRedirect(t *testing.T) {
 	}
 	if original != 1 || redirected != 0 {
 		t.Fatalf("request counts: original=%d redirected=%d", original, redirected)
+	}
+}
+
+func TestAuthorizedClientKeepsCapabilityOnLoopbackMutationOnly(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := api.NewCapability(listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	var mutationAuthorization string
+	var readAuthorization string
+	var tunneledRequests int
+	tunneled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		tunneledRequests++
+		fmt.Fprint(w, "product UI")
+	}))
+	defer tunneled.Close()
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v1/state":
+			readAuthorization = r.Header.Get("Authorization")
+			fmt.Fprint(w, `{"version":1,"environments":[]}`)
+		case "POST /v1/service/start":
+			mutationAuthorization = r.Header.Get("Authorization")
+			http.Redirect(w, r, tunneled.URL+"/", http.StatusTemporaryRedirect)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+	client, err := NewClientWithCapability(server.URL, time.Second, capability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Start(context.Background(), ServiceRequest{EnvironmentID: "dev", ServiceID: "svc"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("start error = %v; want redirect API error", err)
+	}
+	if readAuthorization != "" {
+		t.Fatalf("read-only state request carried Authorization %q", readAuthorization)
+	}
+	if !strings.HasPrefix(mutationAuthorization, "Bearer ") {
+		t.Fatalf("mutation Authorization = %q; want capability bearer", mutationAuthorization)
+	}
+	if tunneledRequests != 0 {
+		t.Fatalf("tunneled product origin received %d redirected requests", tunneledRequests)
+	}
+}
+
+func TestLegacyClientRetainsReadOnlyV1AndFailsMutationsClosed(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &compatibilityRuntime{}
+	server := httptest.NewUnstartedServer(api.New(rt))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := client.GetState(context.Background())
+	if err != nil || state.Version != apiVersion {
+		t.Fatalf("legacy v1 state = %#v, %v", state, err)
+	}
+	_, err = client.Start(context.Background(), ServiceRequest{EnvironmentID: "dev", ServiceID: "svc"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden || apiErr.Code != "caller-not-authorized" {
+		t.Fatalf("tokenless legacy mutation = %v; want caller-not-authorized", err)
+	}
+	if rt.starts != 0 {
+		t.Fatalf("legacy mutation calls = %d; want zero", rt.starts)
 	}
 }
 

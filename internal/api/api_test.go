@@ -51,29 +51,31 @@ func (f *fake) Ensure(_ context.Context, e, s, p string) (runtime.Endpoint, erro
 }
 func TestContract(t *testing.T) {
 	f := &fake{}
+	handler, capability := newAuthorizedAPI(t, f)
 	for _, path := range []string{"start", "stop", "restart"} {
 		w := httptest.NewRecorder()
-		New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/service/"+path, strings.NewReader(`{"environmentId":"e","serviceId":"s"}`)))
+		handler.ServeHTTP(w, authorizedRequest(capability, "POST", "/v1/service/"+path, `{"environmentId":"e","serviceId":"s"}`))
 		if w.Code != 200 || f.action != path || f.env != "e" || f.svc != "s" || !strings.Contains(w.Body.String(), `"version":1,"service"`) {
 			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
 		}
 	}
 	w := httptest.NewRecorder()
-	New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/endpoint/ensure", strings.NewReader(`{"environmentId":"e","serviceId":"s","endpointId":"ui"}`)))
+	handler.ServeHTTP(w, authorizedRequest(capability, "POST", "/v1/endpoint/ensure", `{"environmentId":"e","serviceId":"s","endpointId":"ui"}`))
 	if w.Code != 200 || f.ep != "ui" || !strings.Contains(w.Body.String(), `"endpoint":{"id":"ui"`) {
 		t.Fatal(w.Body.String())
 	}
 	w = httptest.NewRecorder()
-	New(f).ServeHTTP(w, httptest.NewRequest("GET", "/v1/state", nil))
+	handler.ServeHTTP(w, authorizedRequest(capability, "GET", "/v1/state", ""))
 	var state runtime.State
 	if json.Unmarshal(w.Body.Bytes(), &state) != nil || state.Version != 1 {
 		t.Fatal(w.Body.String())
 	}
 }
 func TestInvalidRequests(t *testing.T) {
+	handler, capability := newAuthorizedAPI(t, &fake{})
 	for _, body := range []string{`{}`, `{"environmentId":"e","serviceId":"s","endpointId":"ui"}`, `{"environmentId":"e","serviceId":"s","extra":1}`, `{"environmentId":"e","serviceId":"s"} {}`} {
 		w := httptest.NewRecorder()
-		New(&fake{}).ServeHTTP(w, httptest.NewRequest("POST", "/v1/service/start", strings.NewReader(body)))
+		handler.ServeHTTP(w, authorizedRequest(capability, "POST", "/v1/service/start", body))
 		if w.Code != 400 || !strings.Contains(w.Body.String(), `"code":"invalid-request"`) {
 			t.Fatal(w.Code, w.Body.String())
 		}
@@ -82,8 +84,9 @@ func TestInvalidRequests(t *testing.T) {
 
 func TestActionFailureKeepsStableClassAndBoundedJinushiEvidence(t *testing.T) {
 	f := &fake{startErr: &runtime.Failure{Code: "jinushi-command-failed", Evidence: "invalid-run"}}
+	handler, capability := newAuthorizedAPI(t, f)
 	w := httptest.NewRecorder()
-	New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/service/start", strings.NewReader(`{"environmentId":"e","serviceId":"s"}`)))
+	handler.ServeHTTP(w, authorizedRequest(capability, "POST", "/v1/service/start", `{"environmentId":"e","serviceId":"s"}`))
 	var response struct {
 		Version int `json:"version"`
 		Error   struct {
@@ -111,8 +114,9 @@ func TestActionFailureMapsTimeoutAndConflictStatuses(t *testing.T) {
 	} {
 		t.Run(test.code, func(t *testing.T) {
 			f := &fake{startErr: &runtime.Failure{Code: test.code}}
+			handler, capability := newAuthorizedAPI(t, f)
 			w := httptest.NewRecorder()
-			New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/service/start", strings.NewReader(`{"environmentId":"e","serviceId":"s"}`)))
+			handler.ServeHTTP(w, authorizedRequest(capability, "POST", "/v1/service/start", `{"environmentId":"e","serviceId":"s"}`))
 			if w.Code != test.want {
 				t.Fatalf("status = %d, want %d; response %s", w.Code, test.want, w.Body.String())
 			}
@@ -134,21 +138,23 @@ func (f *registeringFake) Register(s *registry.Snapshot) error {
 }
 func TestRegistrationValidatesBeforeMutation(t *testing.T) {
 	f := &registeringFake{}
+	handler, capability := newAuthorizedAPI(t, f)
 	for _, body := range []string{`{}`, `{"environments":[{"id":"dev","sshHost":"-unsafe"}]}`, `{"environments":[],"services":[]}`} {
 		w := httptest.NewRecorder()
-		New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/environment/register", strings.NewReader(body)))
+		handler.ServeHTTP(w, authorizedRequest(capability, "POST", "/v1/environment/register", body))
 		if w.Code != 400 || f.registrations != 0 {
 			t.Fatal(w.Code, w.Body.String())
 		}
 	}
 	body := `{"environments":[{"id":"dev","sshHost":"host","jinushi":{"supervisorStartCommand":["start"]}}],"services":[]}`
 	w := httptest.NewRecorder()
-	New(f).ServeHTTP(w, httptest.NewRequest("POST", "/v1/environment/register", strings.NewReader(body)))
+	handler.ServeHTTP(w, authorizedRequest(capability, "POST", "/v1/environment/register", body))
 	if w.Code != 200 || f.registrations != 1 {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	w = httptest.NewRecorder()
-	New(&fake{}).ServeHTTP(w, httptest.NewRequest("POST", "/v1/environment/register", strings.NewReader(body)))
+	readOnlyHandler, readOnlyCapability := newAuthorizedAPI(t, &fake{})
+	readOnlyHandler.ServeHTTP(w, authorizedRequest(readOnlyCapability, "POST", "/v1/environment/register", body))
 	if w.Code != 409 {
 		t.Fatal(w.Code)
 	}

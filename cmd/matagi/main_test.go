@@ -13,18 +13,23 @@ import (
 	"time"
 
 	"github.com/yohn-jp/matagi/internal/desktop"
+	"github.com/yohn-jp/matagi/internal/registry"
 	"github.com/yohn-jp/matagi/internal/runtime"
 	"github.com/yohn-jp/matagi/internal/settings"
 )
 
 type fakeRuntime struct {
-	closed  atomic.Bool
-	running atomic.Bool
-	fail    error
+	closed    atomic.Bool
+	running   atomic.Bool
+	connects  atomic.Int32
+	additions atomic.Int32
+	starts    atomic.Int32
+	fail      error
 }
 
 func (r *fakeRuntime) Snapshot() runtime.State { return runtime.State{Version: 1} }
 func (r *fakeRuntime) Start(context.Context, string, string) (runtime.Service, error) {
+	r.starts.Add(1)
 	return runtime.Service{}, nil
 }
 func (r *fakeRuntime) Stop(context.Context, string, string) (runtime.Service, error) {
@@ -35,6 +40,14 @@ func (r *fakeRuntime) Restart(context.Context, string, string) (runtime.Service,
 }
 func (r *fakeRuntime) Ensure(context.Context, string, string, string) (runtime.Endpoint, error) {
 	return runtime.Endpoint{}, nil
+}
+func (r *fakeRuntime) Connect(context.Context, string, string, []string) error {
+	r.connects.Add(1)
+	return nil
+}
+func (r *fakeRuntime) AddService(registry.Service) error {
+	r.additions.Add(1)
+	return nil
 }
 func (r *fakeRuntime) Run(ctx context.Context) error {
 	r.running.Store(true)
@@ -99,6 +112,34 @@ func TestProductionComposition(t *testing.T) {
 				if err != nil || updates.StatusCode != http.StatusOK || !strings.Contains(string(updateBody), `lang="ja"`) {
 					return errors.New("production updates surface did not use saved locale")
 				}
+				registered, err := c.PostForm(w.URL+"register", url.Values{"token": {token}, "name": {"dev"}, "host": {"dev-host"}})
+				if err != nil {
+					return err
+				}
+				registered.Body.Close()
+				if registered.StatusCode != http.StatusOK || rt.connects.Load() != 1 {
+					return errors.New("authorized UI registration did not reach the runtime")
+				}
+				added, err := c.PostForm(w.URL+"service/add", url.Values{
+					"token": {token}, "environmentId": {"dev"}, "service": {"demo"}, "command": {"demo"}, "cwd": {"/work"}, "port": {"3000"},
+				})
+				if err != nil {
+					return err
+				}
+				added.Body.Close()
+				if added.StatusCode != http.StatusOK || rt.additions.Load() != 1 {
+					return errors.New("authorized UI service registration did not reach the runtime")
+				}
+				action, err := c.PostForm(w.URL+"action", url.Values{
+					"token": {token}, "environmentId": {"dev"}, "serviceId": {"demo"}, "action": {"start"},
+				})
+				if err != nil {
+					return err
+				}
+				action.Body.Close()
+				if action.StatusCode != http.StatusOK || rt.starts.Load() != 1 {
+					return errors.New("authorized UI service control did not reach the runtime")
+				}
 				break
 			}
 			if time.Now().After(deadline) {
@@ -116,6 +157,9 @@ func TestProductionComposition(t *testing.T) {
 	}
 	if !rt.closed.Load() || !rt.running.Load() {
 		t.Fatal("runtime was not run and closed")
+	}
+	if rt.connects.Load() != 1 || rt.additions.Load() != 1 || rt.starts.Load() != 1 {
+		t.Fatalf("authorized UI calls: connect=%d add=%d start=%d", rt.connects.Load(), rt.additions.Load(), rt.starts.Load())
 	}
 	prefs, err := settings.NewStore(filepath.Join(configDir, "Matagi"))
 	if err != nil {

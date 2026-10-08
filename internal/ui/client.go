@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/yohn-jp/matagi/internal/api"
 )
 
 const (
@@ -22,14 +24,30 @@ const (
 
 // Client consumes only the frozen loopback HTTP v1 service contract.
 type Client struct {
-	baseURL *url.URL
-	http    *http.Client
+	baseURL    *url.URL
+	http       *http.Client
+	capability api.Capability
 }
 
-// NewClient creates a client with a bounded request timeout. Redirects are
-// returned to the caller so POST operations can never be replayed by HTTP
-// redirect handling.
+// NewClient creates a tokenless client with a bounded request timeout. Legacy
+// callers keep read-only GET /v1/state access and the v1 route/body contract;
+// their mutation calls fail closed until they use NewClientWithCapability.
+// Redirects are returned to the caller so POST operations can never be
+// replayed by HTTP redirect handling.
 func NewClient(baseURL string, timeout time.Duration) (*Client, error) {
+	return newClient(baseURL, timeout, api.Capability{})
+}
+
+// NewClientWithCapability creates a client authorized to call the existing v1
+// mutation routes. The in-process caller must receive the same Capability as
+// the handler; the capability is attached only to POSTs sent to the validated
+// IPv4 loopback API origin. Raw v1 HTTP callers can use Capability.AddToRequest
+// without changing route paths or JSON payloads.
+func NewClientWithCapability(baseURL string, timeout time.Duration, capability api.Capability) (*Client, error) {
+	return newClient(baseURL, timeout, capability)
+}
+
+func newClient(baseURL string, timeout time.Duration, capability api.Capability) (*Client, error) {
 	if timeout <= 0 {
 		return nil, errors.New("HTTP client timeout must be positive")
 	}
@@ -43,7 +61,8 @@ func NewClient(baseURL string, timeout time.Duration) (*Client, error) {
 	origin, _ := LoopbackHTTPOrigin(baseURL)
 	parsed, _ := url.Parse(origin)
 	return &Client{
-		baseURL: parsed,
+		baseURL:    parsed,
+		capability: capability,
 		http: &http.Client{
 			Timeout: timeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -275,6 +294,9 @@ func (c *Client) request(ctx context.Context, method, route string, body, dst an
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if method == http.MethodPost {
+		c.capability.AddToRequest(req)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
