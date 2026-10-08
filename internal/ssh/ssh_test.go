@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -80,14 +81,21 @@ func TestRunPreservesArgumentsAcrossRemoteShell(t *testing.T) {
 		"contains spaces and\ttabs",
 		"single'quoted'",
 		`double"quoted"`,
+		"café 日本語",
 		"$(touch " + markerFile + ")",
 		"`touch " + markerFile + "`",
 		`backslash\value`,
-		string([]byte{0xff, 0x80}),
+	}
+	if runtime.GOOS != "windows" {
+		// Windows process arguments are Unicode and cannot carry arbitrary
+		// non-UTF-8 bytes through exec.Command.
+		wantCommand = append(wantCommand, string([]byte{0xff, 0x80}))
+	}
+	wantCommand = append(wantCommand,
 		"--cwd",
 		filepath.Join(tempDir, "cwd with spaces and 'quotes'"),
-		"separator;touch " + markerFile,
-	}
+		"separator;touch "+markerFile,
+	)
 
 	client := newClient("ssh", func(ctx context.Context, _ string, args []string) processResult {
 		if len(args) < 2 {
