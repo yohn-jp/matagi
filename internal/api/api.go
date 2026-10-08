@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,9 +25,22 @@ type Runtime interface {
 	Restart(context.Context, string, string) (runtime.Service, error)
 	Ensure(context.Context, string, string, string) (runtime.Endpoint, error)
 }
-type Handler struct{ runtime Runtime }
+type Handler struct {
+	runtime    Runtime
+	capability Capability
+}
 
-func New(r Runtime) http.Handler { return &Handler{runtime: r} }
+// New creates a read-only API handler. Mutating v1 routes require a handler
+// created with NewWithCapability.
+func New(r Runtime) http.Handler { return NewWithCapability(r, Capability{}) }
+
+// NewWithCapability creates an API handler that admits authorized v1
+// mutations while preserving the existing routes and JSON payloads. A
+// programmatic caller must hold the same in-memory Capability and add it to
+// each loopback POST with Capability.AddToRequest.
+func NewWithCapability(r Runtime, capability Capability) http.Handler {
+	return &Handler{runtime: r, capability: capability}
+}
 
 // Registration is available only on the production runtime, not on read-only API fakes.
 type registrar interface {
@@ -62,6 +78,9 @@ func failureWithMessage(w http.ResponseWriter, status int, code, message string)
 	}{code, message}})
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost && isMutationPath(r.URL.Path) && !h.admitMutation(w, r) {
+		return
+	}
 	if r.URL.Path == "/v1/environment/connect" && r.Method == http.MethodPost {
 		owner, ok := h.runtime.(interface {
 			Connect(context.Context, string, string, []string) error
@@ -262,6 +281,81 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}{1, result})
 	}
 }
+
+func isMutationPath(path string) bool {
+	switch path {
+	case "/v1/environment/connect", "/v1/service/add", "/v1/environment/ensure-jinushi", "/v1/environment/register",
+		"/v1/service/start", "/v1/service/stop", "/v1/service/restart", "/v1/endpoint/ensure":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) admitMutation(w http.ResponseWriter, r *http.Request) bool {
+	if !safeMutationOrigin(r) {
+		failure(w, http.StatusForbidden, "unsafe-request-origin")
+		return false
+	}
+	if !jsonContentType(r.Header.Values("Content-Type")) {
+		failure(w, http.StatusUnsupportedMediaType, "unsupported-media-type")
+		return false
+	}
+	if !h.capability.permits(r.Header.Values(capabilityHeader), r.Host) {
+		failure(w, http.StatusForbidden, "caller-not-authorized")
+		return false
+	}
+	return true
+}
+
+func safeMutationOrigin(r *http.Request) bool {
+	requestPort, ok := loopbackRequestPort(r.Host)
+	if !ok {
+		return false
+	}
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		return true
+	}
+	if len(origins) != 1 {
+		return false
+	}
+	origin, err := url.Parse(origins[0])
+	if err != nil || origin.Scheme != "http" || origin.User != nil || origin.Opaque != "" || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		return false
+	}
+	originPort, ok := loopbackRequestPort(origin.Host)
+	return ok && originPort == requestPort
+}
+
+func loopbackRequestPort(host string) (string, bool) {
+	address, portText, err := net.SplitHostPort(host)
+	if err != nil || address != "127.0.0.1" {
+		return "", false
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port == 0 {
+		return "", false
+	}
+	return strconv.FormatUint(port, 10), true
+}
+
+func jsonContentType(values []string) bool {
+	if len(values) != 1 {
+		return false
+	}
+	mediaType, params, err := mime.ParseMediaType(values[0])
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		return false
+	}
+	for name, value := range params {
+		if !strings.EqualFold(name, "charset") || !strings.EqualFold(value, "utf-8") {
+			return false
+		}
+	}
+	return true
+}
+
 func decodeRequest(r *http.Request, dst any) bool {
 	decoder := json.NewDecoder(io.LimitReader(r.Body, 65537))
 	decoder.DisallowUnknownFields()
