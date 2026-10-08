@@ -43,6 +43,13 @@ type Client struct {
 	supervisorStartCommand []string
 }
 
+// RestartAttempt carries the stop target selected by the first attempt. It is
+// retained by the caller while a Restart submission has an ambiguous outcome.
+type RestartAttempt struct {
+	stopRunID       string
+	stopTargetBound bool
+}
+
 // New constructs a lifecycle client. A positive timeout is required because
 // every remote command must have a bounded lifetime.
 func New(executor Executor, options Options) (*Client, error) {
@@ -257,10 +264,21 @@ func (c *Client) Stop(ctx context.Context, serviceID string) (ServiceStatus, err
 	return ServiceStatus{ServiceID: serviceID, Run: &stopped}, err
 }
 
-// Restart proves the previous Run terminal before submitting a new Run. The
-// request must contain a fresh submission ID; retries of an ambiguous restart
-// must reuse that same submission ID.
+// Restart performs one Restart attempt and proves the previous Run terminal
+// before submitting a new Run. Callers retrying an ambiguous outcome must
+// retain RestartAttempt state and use RestartWithAttempt.
 func (c *Client) Restart(ctx context.Context, request StartRequest) (Run, error) {
+	return c.RestartWithAttempt(ctx, request, &RestartAttempt{})
+}
+
+// RestartWithAttempt retries one logical Restart with its original stop
+// target and submission identity. A different owner-correlated Run is never
+// treated as proof of this attempt; the same submission is replayed so
+// Jinushi can reconcile it by the canonical submission identity.
+func (c *Client) RestartWithAttempt(ctx context.Context, request StartRequest, attempt *RestartAttempt) (Run, error) {
+	if attempt == nil {
+		return Run{}, &Failure{Kind: KindInvalid, Message: "restart attempt state is required"}
+	}
 	if err := validateStartRequest(request); err != nil {
 		return Run{}, err
 	}
@@ -270,6 +288,20 @@ func (c *Client) Restart(ctx context.Context, request StartRequest) (Run, error)
 	current, err := c.currentRun(ctx, request.Service.ID)
 	if err != nil {
 		return Run{}, err
+	}
+	if !attempt.stopTargetBound {
+		attempt.stopTargetBound = true
+		if current != nil {
+			attempt.stopRunID = current.ID
+		}
+	} else if current != nil && current.ID != attempt.stopRunID {
+		if current.State != StateTerminal && !knownLiveState(current.State) {
+			return *current, &Failure{Kind: KindUncertain, RunID: current.ID, State: current.State, Message: "Jinushi Run state does not prove that restart submission reconciliation is safe"}
+		}
+		// Run the same submission again so Jinushi resolves this attempt by its
+		// canonical submission identity instead of adopting an unrelated
+		// correlated Run or canceling the newly observed Run.
+		return c.startRun(ctx, request)
 	}
 	if current != nil {
 		inspected, err := c.inspect(ctx, *current, request.Service.ID)

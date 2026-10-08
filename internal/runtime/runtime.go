@@ -122,6 +122,10 @@ type binding struct {
 	environment      registry.Environment
 	control, observe *jinushi.Client
 }
+type pendingSubmission struct {
+	submissionID string
+	restart      jinushi.RestartAttempt
+}
 type Runtime struct {
 	mu               sync.Mutex
 	registry         *registry.Snapshot
@@ -131,7 +135,7 @@ type Runtime struct {
 	services         map[string]registry.Service
 	tunnels          *tunnel.Manager
 	observer         *health.Observer
-	pending          map[string]string
+	pending          map[string]pendingSubmission
 	jinushi          map[string]string
 	endpointFailures map[tunnel.Identity]string
 	closed           bool
@@ -180,7 +184,7 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 	if snapshot == nil || client == nil || manager == nil {
 		return nil, errors.New("registry, SSH client and tunnel manager are required")
 	}
-	r := &Runtime{ssh: client, tunnels: manager, pending: map[string]string{}, jinushi: map[string]string{}, endpointFailures: map[tunnel.Identity]string{}, httpClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	r := &Runtime{ssh: client, tunnels: manager, pending: map[string]pendingSubmission{}, jinushi: map[string]string{}, endpointFailures: map[tunnel.Identity]string{}, httpClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	if err := r.configure(snapshot); err != nil {
 		return nil, err
 	}
@@ -380,32 +384,38 @@ func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, 
 	}
 	owner := s.CorrelationOwner()
 	b := r.bindings[env]
-	token := r.pending[key(env, id)]
-	if action != "stop" && token == "" {
+	pendingKey := key(env, id)
+	pending := r.pending[pendingKey]
+	if action != "stop" && pending.submissionID == "" {
+		var token string
 		token, err = jinushi.NewSubmissionID()
 		if err != nil {
 			return Service{}, classify(err)
 		}
-		r.pending[key(env, id)] = token
+		pending.submissionID = token
+		r.pending[pendingKey] = pending
 	}
 	var run jinushi.Run
 	var observedRun *jinushi.Run
 	switch action {
 	case "start":
-		run, err = b.control.Start(ctx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: token})
+		run, err = b.control.Start(ctx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: pending.submissionID})
 		observedRun = &run
 	case "restart":
-		run, err = b.control.Restart(ctx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: token})
+		run, err = b.control.RestartWithAttempt(ctx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: pending.submissionID}, &pending.restart)
 		observedRun = &run
 	case "stop":
 		var status jinushi.ServiceStatus
 		status, err = b.control.Stop(ctx, owner)
 		observedRun = status.Run
 	}
+	if action != "stop" {
+		r.pending[pendingKey] = pending
+	}
 	if err != nil {
 		var failure *jinushi.Failure
 		if action != "stop" && errors.As(err, &failure) && (failure.Kind == jinushi.KindInvalid || failure.Kind == jinushi.KindCommand || failure.Kind == jinushi.KindBootstrapFailed) {
-			delete(r.pending, key(env, id))
+			delete(r.pending, pendingKey)
 		}
 		return Service{}, classify(err)
 	}
@@ -415,7 +425,7 @@ func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, 
 		}
 	}
 	if action == "stop" || run.ID != "" {
-		delete(r.pending, key(env, id))
+		delete(r.pending, pendingKey)
 	}
 	desired := registry.DesiredRunning
 	if action == "stop" {
