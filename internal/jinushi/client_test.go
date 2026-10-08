@@ -387,6 +387,87 @@ func TestStopUsesFreshGenerationAndRetainsTerminalOutcome(t *testing.T) {
 	}
 }
 
+func TestRestartRetryUsesSubmissionIdentityInsteadOfAdoptingDifferentRun(t *testing.T) {
+	old := testRun("run-old", StateRunning, 3, "service-a")
+	oldInspection := old
+	oldInspection.Generation = 4
+	terminal := testRun("run-old", StateTerminal, 5, "service-a")
+	terminal.Receipt = &Receipt{Outcome: "cancelled"}
+	external := testRun("run-external", StateRunning, 7, "service-a")
+	attempted := testRun("run-new", StateAccepted, 1, "service-a")
+	current := old
+	createdBySubmission := map[string]Run{}
+	var submissionIDs []string
+	var cancelledRunIDs []string
+	physicalRuns := 0
+	executor := &fakeExecutor{run: func(_ context.Context, argv []string, _ time.Duration) (CommandResult, error) {
+		switch argv[1] {
+		case "status":
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "status": map[string]any{}}), nil
+		case "list":
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "runs": []Run{current}}), nil
+		case "inspect":
+			switch argv[len(argv)-1] {
+			case old.ID:
+				return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "run": oldInspection}), nil
+			case external.ID:
+				return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "run": external}), nil
+			default:
+				t.Fatalf("unexpected inspect command %v", argv)
+				return CommandResult{}, nil
+			}
+		case "cancel":
+			cancelledRunIDs = append(cancelledRunIDs, argv[len(argv)-1])
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": ""}), nil
+		case "await":
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "run": terminal}), nil
+		case "run":
+			var submissionID string
+			for _, arg := range argv {
+				if strings.HasPrefix(arg, "--submission-id=") {
+					submissionID = strings.TrimPrefix(arg, "--submission-id=")
+				}
+			}
+			submissionIDs = append(submissionIDs, submissionID)
+			run, exists := createdBySubmission[submissionID]
+			if !exists {
+				physicalRuns++
+				run = attempted
+				createdBySubmission[submissionID] = run
+				return CommandResult{}, &ExecutionError{Kind: ExecutionTransportFailure, Err: errors.New("response lost after submission")}
+			}
+			return jsonResult(t, 0, map[string]any{"version": 1, "nextCursor": "", "run": run}), nil
+		default:
+			t.Fatalf("unexpected command %v", argv)
+			return CommandResult{}, nil
+		}
+	}}
+	client := newTestClient(t, executor, Options{CommandTimeout: time.Second})
+	request := StartRequest{Service: Service{ID: "service-a", Argv: []string{"serve"}, Cwd: "/srv/app"}, SubmissionID: "submission-stable"}
+	attempt := &RestartAttempt{}
+	if _, err := client.RestartWithAttempt(context.Background(), request, attempt); !isKind(err, KindTransport) {
+		t.Fatalf("first RestartWithAttempt() error = %v, want lost-response transport failure", err)
+	}
+	if !attempt.stopTargetBound || attempt.stopRunID != old.ID {
+		t.Fatalf("bound restart target = %#v; want original Run %q", attempt, old.ID)
+	}
+	current = external
+
+	result, err := client.RestartWithAttempt(context.Background(), request, attempt)
+	if err != nil {
+		t.Fatalf("retry RestartWithAttempt(): %v", err)
+	}
+	if result.ID != attempted.ID {
+		t.Fatalf("retry RestartWithAttempt() returned %q; want submission's Run %q", result.ID, attempted.ID)
+	}
+	if len(cancelledRunIDs) != 1 || cancelledRunIDs[0] != old.ID {
+		t.Fatalf("cancelled Run IDs = %v; want only the original target %q", cancelledRunIDs, old.ID)
+	}
+	if physicalRuns != 1 || len(submissionIDs) != 2 || submissionIDs[0] != request.SubmissionID || submissionIDs[1] != request.SubmissionID {
+		t.Fatalf("physical Runs = %d, submitted IDs = %v; want one physical Run and the same submission ID on retry", physicalRuns, submissionIDs)
+	}
+}
+
 func TestRestartWaitsForTerminalAndUsesNewSubmissionID(t *testing.T) {
 	old := testRun("run-old", StateRunning, 3, "service-a")
 	old.CreatedAt = time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)

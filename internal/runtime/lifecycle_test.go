@@ -65,7 +65,7 @@ func TestAmbiguousSubmissionAndRotation(t *testing.T) {
 	if environment := snapshot.Environments[0]; environment.Connectivity != "connected" || environment.Jinushi != "ready" {
 		t.Fatalf("immediate environment snapshot = %#v; successful Jinushi action did not refresh its authority state", environment)
 	}
-	if submissions[0] != submissions[1] || submissions[1] != submissions[2] || r.pending[key("env", "svc")] != "" {
+	if submissions[0] != submissions[1] || submissions[1] != submissions[2] || r.pending[key("env", "svc")].submissionID != "" {
 		t.Fatal(submissions)
 	}
 	_, err := r.Start(ctx, "env", "svc")
@@ -73,6 +73,119 @@ func TestAmbiguousSubmissionAndRotation(t *testing.T) {
 		t.Fatal(submissions, err)
 	}
 	_ = r.Close(ctx)
+}
+
+func TestRestartAmbiguousSubmissionDoesNotCancelAttemptedRun(t *testing.T) {
+	tests := []struct {
+		name             string
+		initialRunID     string
+		wantCancelledIDs []string
+	}{
+		{name: "original Run", initialRunID: "run-old", wantCancelledIDs: []string{"run-old"}},
+		{name: "no original Run"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r, client, _ := lifecycleRuntime(t, registry.DesiredRunning)
+			owner := r.services[key("env", "svc")].CorrelationOwner()
+			runJSON := func(id, state string, generation int, receipt string) string {
+				receiptJSON := ""
+				if receipt != "" {
+					receiptJSON = fmt.Sprintf(`,"receipt":{"outcome":%q}`, receipt)
+				}
+				return fmt.Sprintf(`{"runId":%q,"state":%q,"generation":%d,"createdAt":"2026-10-07T00:00:00Z","spec":{"correlation":{"owner":%q}}%s}`, id, state, generation, owner, receiptJSON)
+			}
+			runs := map[string]string{}
+			if test.initialRunID != "" {
+				runs[test.initialRunID] = runJSON(test.initialRunID, "running", 1, "")
+			}
+			currentRunID := test.initialRunID
+			createdBySubmission := map[string]string{}
+			var submissionIDs []string
+			var cancelledRunIDs []string
+			physicalRuns := 0
+			runCalls := 0
+			client.fn = func(args []string) (ssh.Result, error) {
+				if len(args) == 1 && args[0] == "true" {
+					return ssh.Result{ExitCode: 0}, nil
+				}
+				switch args[1] {
+				case "status":
+					return ssh.Result{Stdout: []byte(`{"version":1,"status":{}}`)}, nil
+				case "list":
+					if currentRunID == "" {
+						return ssh.Result{Stdout: []byte(`{"version":1,"runs":[],"nextCursor":""}`)}, nil
+					}
+					return ssh.Result{Stdout: []byte(fmt.Sprintf(`{"version":1,"runs":[%s],"nextCursor":""}`, runs[currentRunID]))}, nil
+				case "inspect":
+					id := args[len(args)-1]
+					return ssh.Result{Stdout: []byte(fmt.Sprintf(`{"version":1,"run":%s}`, runs[id]))}, nil
+				case "cancel":
+					cancelledRunIDs = append(cancelledRunIDs, args[len(args)-1])
+					return ssh.Result{Stdout: []byte(`{"version":1}`)}, nil
+				case "await":
+					id := args[len(args)-1]
+					runs[id] = runJSON(id, "terminal", 2, "cancelled")
+					if currentRunID == id {
+						currentRunID = ""
+					}
+					return ssh.Result{Stdout: []byte(fmt.Sprintf(`{"version":1,"run":%s}`, runs[id]))}, nil
+				case "run":
+					var submissionID string
+					for _, arg := range args {
+						if strings.HasPrefix(arg, "--submission-id=") {
+							submissionID = strings.TrimPrefix(arg, "--submission-id=")
+						}
+					}
+					submissionIDs = append(submissionIDs, submissionID)
+					id, exists := createdBySubmission[submissionID]
+					if !exists {
+						id = "run-new"
+						createdBySubmission[submissionID] = id
+						physicalRuns++
+					}
+					runs[id] = runJSON(id, "accepted", 1, "")
+					currentRunID = id
+					runCalls++
+					if runCalls == 1 {
+						return ssh.Result{ExitCode: -1}, &ssh.Error{Kind: ssh.FailureTransport, Err: errors.New("lost response after remote submission")}
+					}
+					return ssh.Result{Stdout: []byte(fmt.Sprintf(`{"version":1,"run":%s}`, runs[id]))}, nil
+				default:
+					return ssh.Result{}, fmt.Errorf("unexpected Jinushi command %v", args)
+				}
+			}
+
+			if _, err := r.Restart(context.Background(), "env", "svc"); err == nil {
+				t.Fatal("first Restart() succeeded despite losing the submission response")
+			}
+			submissionID := r.pending[key("env", "svc")].submissionID
+			if len(submissionIDs) != 1 || submissionID == "" || submissionIDs[0] != submissionID {
+				t.Fatalf("pending submission ID = %q, submitted IDs = %v; want the first attempt retained", submissionID, submissionIDs)
+			}
+			service, err := r.Restart(context.Background(), "env", "svc")
+			if err != nil {
+				t.Fatalf("retry Restart(): %v", err)
+			}
+			if service.Process != "starting" || service.DesiredState != registry.DesiredRunning {
+				t.Fatalf("retry Restart() = %#v; want the attempted Run and running intent", service)
+			}
+			if len(cancelledRunIDs) != len(test.wantCancelledIDs) {
+				t.Fatalf("cancelled Run IDs = %v; want %v", cancelledRunIDs, test.wantCancelledIDs)
+			}
+			for i := range test.wantCancelledIDs {
+				if cancelledRunIDs[i] != test.wantCancelledIDs[i] {
+					t.Fatalf("cancelled Run IDs = %v; want %v", cancelledRunIDs, test.wantCancelledIDs)
+				}
+			}
+			if physicalRuns != 1 {
+				t.Fatalf("physical Runs created = %d; want one for the stable submission identity", physicalRuns)
+			}
+			if len(submissionIDs) != 2 || submissionIDs[0] != submissionID || submissionIDs[1] != submissionID {
+				t.Fatalf("submission IDs = %v; want one stable identity across both attempts", submissionIDs)
+			}
+		})
+	}
 }
 
 func lifecycleRuntime(t *testing.T, desired registry.DesiredState) (*Runtime, *fakeSSH, *config.Store) {
