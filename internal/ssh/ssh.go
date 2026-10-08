@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -97,9 +98,10 @@ func newClient(executable string, run processRunner) *Client {
 	return &Client{executable: executable, run: run}
 }
 
-// Run executes command against the registered OpenSSH host target. Each
-// command element is passed as a separate process argument. A positive timeout
-// is required so the SSH process always has a bounded lifetime.
+// Run executes command against the registered OpenSSH host target. The remote
+// arguments are shell-quoted into one command string because OpenSSH sends the
+// command through the remote user's shell. A positive timeout is required so
+// the SSH process always has a bounded lifetime.
 func (c *Client) Run(ctx context.Context, target string, command []string, timeout time.Duration) (Result, error) {
 	result := Result{ExitCode: -1}
 	if ctx == nil {
@@ -121,9 +123,7 @@ func (c *Client) Run(ctx context.Context, target string, command []string, timeo
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := make([]string, 0, len(command)+1)
-	args = append(args, target)
-	args = append(args, command...)
+	args := []string{target, serializeRemoteCommand(command)}
 
 	process := c.run(runCtx, c.executable, args)
 	result.Stdout = append([]byte(nil), process.stdout...)
@@ -146,6 +146,14 @@ func (c *Client) Run(ctx context.Context, target string, command []string, timeo
 		return result, &Error{Kind: FailureRemoteCommand, Err: process.err, ExitCode: process.exitCode}
 	}
 	return result, &Error{Kind: FailureProcess, Err: process.err, ExitCode: -1}
+}
+
+func serializeRemoteCommand(command []string) string {
+	serialized := make([]string, len(command))
+	for index, argument := range command {
+		serialized[index] = "'" + strings.ReplaceAll(argument, "'", "'\\''") + "'"
+	}
+	return strings.Join(serialized, " ")
 }
 
 func runProcess(ctx context.Context, executable string, args []string) processResult {

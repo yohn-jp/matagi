@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -38,8 +39,8 @@ func TestResolveExecutableReportsMissingSSH(t *testing.T) {
 	}
 }
 
-func TestRunPassesTargetAndCommandAsSeparateArguments(t *testing.T) {
-	wantArgs := []string{"dev-box", "printf", "%s %s", "hello world", "$(touch /tmp/not-run)"}
+func TestRunPassesTargetAndSerializedCommand(t *testing.T) {
+	wantArgs := []string{"dev-box", "'printf' '%s %s' 'hello world' '$(touch /tmp/not-run)'"}
 	var gotArgs []string
 	client := newClient("/system/bin/ssh", func(_ context.Context, path string, args []string) processResult {
 		if path != "/system/bin/ssh" {
@@ -58,6 +59,72 @@ func TestRunPassesTargetAndCommandAsSeparateArguments(t *testing.T) {
 	}
 	if string(result.Stdout) != "ok\n" || string(result.Stderr) != "notice\n" || result.ExitCode != 0 {
 		t.Fatalf("Run() result = %#v", result)
+	}
+}
+
+func TestRunPreservesArgumentsAcrossRemoteShell(t *testing.T) {
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("remote-shell regression requires a POSIX sh: %v", err)
+	}
+
+	tempDir := t.TempDir()
+	captureFile := filepath.Join(tempDir, "captured-argv")
+	markerFile := filepath.Join(tempDir, "shell-injection-ran")
+	wantCommand := []string{
+		os.Args[0],
+		"-test.run=^TestSSHProcessHelper$",
+		"--",
+		"capture",
+		captureFile,
+		"",
+		"contains spaces and\ttabs",
+		"single'quoted'",
+		`double"quoted"`,
+		"café 日本語",
+		"$(touch " + markerFile + ")",
+		"`touch " + markerFile + "`",
+		`backslash\value`,
+	}
+	if runtime.GOOS != "windows" {
+		// Windows process arguments are Unicode and cannot carry arbitrary
+		// non-UTF-8 bytes through exec.Command.
+		wantCommand = append(wantCommand, string([]byte{0xff, 0x80}))
+	}
+	wantCommand = append(wantCommand,
+		"--cwd",
+		filepath.Join(tempDir, "cwd with spaces and 'quotes'"),
+		"separator;touch "+markerFile,
+	)
+
+	client := newClient("ssh", func(ctx context.Context, _ string, args []string) processResult {
+		if len(args) < 2 {
+			return processResult{exitCode: -1, err: errors.New("OpenSSH received no remote command")}
+		}
+		// OpenSSH joins all local arguments after the target into one remote
+		// command string. Running it through sh exercises that shell boundary.
+		return runProcess(ctx, shell, []string{"-c", strings.Join(args[1:], " ")})
+	})
+
+	result, err := client.Run(context.Background(), "dev-box", wantCommand, 10*time.Second)
+	if err != nil {
+		t.Fatalf("Run() through remote shell result = %#v, error = %v", result, err)
+	}
+
+	captured, err := os.ReadFile(captureFile)
+	if err != nil {
+		t.Fatalf("remote helper did not capture argv: %v", err)
+	}
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Fatalf("remote shell interpreted argument data: marker %q exists", markerFile)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("checking shell-injection marker: %v", err)
+	}
+
+	gotArgs := strings.Split(string(captured), "\x00")
+	wantArgs := wantCommand[5:]
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("remote argv = %#v, want %#v", gotArgs, wantArgs)
 	}
 }
 
@@ -198,6 +265,15 @@ func TestSSHProcessHelper(t *testing.T) {
 		fmt.Fprint(os.Stdout, "helper stdout")
 		fmt.Fprint(os.Stderr, "helper stderr")
 		os.Exit(17)
+	case "capture":
+		if marker+2 >= len(os.Args) {
+			fmt.Fprintln(os.Stderr, "capture mode requires an output path")
+			os.Exit(2)
+		}
+		if err := os.WriteFile(os.Args[marker+2], []byte(strings.Join(os.Args[marker+3:], "\x00")), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
 	default:
 		fmt.Fprintln(os.Stderr, "unknown helper mode:", strings.Join(os.Args[marker+1:], " "))
 		os.Exit(2)

@@ -38,11 +38,11 @@ type fixtureState struct {
 
 func main() {
 	args := os.Args[1:]
-	logArgs(args)
 	if len(args) == 0 {
 		fail("missing arguments")
 	}
 	if args[0] == "-N" {
+		logArgs(args)
 		if err := forward(args); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(255)
@@ -52,7 +52,13 @@ func main() {
 	if len(args) < 2 {
 		fail("missing remote command")
 	}
-	command := args[1:]
+	command, err := parseRemoteCommand(strings.Join(args[1:], " "))
+	if err != nil {
+		fail("invalid serialized remote command: " + err.Error())
+	}
+	// Log the effective remote argv after emulating the shell OpenSSH invokes
+	// for its command string. This is not the raw process argv OpenSSH receives.
+	logArgs(append([]string{args[0]}, command...))
 	if len(command) == 1 && command[0] == "true" {
 		return
 	}
@@ -115,6 +121,60 @@ func main() {
 	default:
 		fail("unsupported Jinushi command")
 	}
+}
+
+func parseRemoteCommand(serialized string) ([]string, error) {
+	var arguments []string
+	var current strings.Builder
+	quoted := false
+	started := false
+	for index := 0; index < len(serialized); {
+		character := serialized[index]
+		if quoted {
+			if character == '\'' {
+				quoted = false
+				index++
+				continue
+			}
+			current.WriteByte(character)
+			index++
+			continue
+		}
+
+		switch character {
+		case '\'':
+			quoted = true
+			started = true
+			index++
+		case '\\':
+			if !started || index+1 >= len(serialized) || serialized[index+1] != '\'' {
+				return nil, fmt.Errorf("unexpected escape at byte %d", index)
+			}
+			current.WriteByte('\'')
+			index += 2
+		case ' ':
+			if !started {
+				return nil, fmt.Errorf("unexpected separator at byte %d", index)
+			}
+			arguments = append(arguments, current.String())
+			current.Reset()
+			started = false
+			index++
+		default:
+			return nil, fmt.Errorf("unexpected unquoted character %q at byte %d", character, index)
+		}
+	}
+	if quoted {
+		return nil, errors.New("unterminated single-quoted argument")
+	}
+	if !started {
+		if len(arguments) == 0 {
+			return nil, errors.New("empty remote command")
+		}
+		return nil, errors.New("trailing argument separator")
+	}
+	arguments = append(arguments, current.String())
+	return arguments, nil
 }
 
 func readEndpointDescriptor(command []string) {
