@@ -19,9 +19,15 @@ import (
 const (
 	viewsEnvironmentCreateControllerSlot = 3
 
+	viewsControllerGetIsVisibleSlot                      = 3
 	viewsControllerPutIsVisibleSlot                      = 4
+	viewsControllerGetBoundsSlot                         = 5
 	viewsControllerPutBoundsSlot                         = 6
 	viewsControllerMoveFocusSlot                         = 12
+	viewsControllerAddMoveFocusRequestedSlot             = 13
+	viewsControllerRemoveMoveFocusRequestedSlot          = 14
+	viewsControllerGetParentWindowSlot                   = 21
+	viewsControllerPutParentWindowSlot                   = 22
 	viewsControllerNotifyParentWindowPositionChangedSlot = 23
 	viewsControllerCloseSlot                             = 24
 	viewsControllerGetCoreWebView2Slot                   = 25
@@ -76,6 +82,17 @@ func (c *viewsController) PutIsVisible(visible bool) error {
 	return err
 }
 
+func (c *viewsController) GetIsVisible() (bool, error) {
+	if c == nil || c.pointer == nil {
+		return false, errors.New("WebView2 controller is unavailable")
+	}
+	var visible int32
+	err := viewsCOMCall(c.pointer, viewsControllerGetIsVisibleSlot, uintptr(unsafe.Pointer(&visible)))
+	runtime.KeepAlive(&visible)
+	runtime.KeepAlive(c)
+	return visible != 0, err
+}
+
 func (c *viewsController) PutBounds(bounds viewsRECT) error {
 	if err := viewsCOMCall(c.pointer, viewsControllerPutBoundsSlot, uintptr(unsafe.Pointer(&bounds))); err != nil {
 		runtime.KeepAlive(&bounds)
@@ -87,8 +104,82 @@ func (c *viewsController) PutBounds(bounds viewsRECT) error {
 	return nil
 }
 
+func (c *viewsController) GetParentWindow() (uintptr, error) {
+	if c == nil || c.pointer == nil {
+		return 0, errors.New("WebView2 controller is unavailable")
+	}
+	var parent uintptr
+	err := viewsCOMCall(c.pointer, viewsControllerGetParentWindowSlot, uintptr(unsafe.Pointer(&parent)))
+	runtime.KeepAlive(&parent)
+	runtime.KeepAlive(c)
+	if err != nil {
+		return 0, err
+	}
+	if parent == 0 {
+		return 0, errors.New("WebView2 controller has no parent window")
+	}
+	return parent, nil
+}
+
+func (c *viewsController) PutParentWindow(parent uintptr) error {
+	if c == nil || c.pointer == nil {
+		return errors.New("WebView2 controller is unavailable")
+	}
+	if parent == 0 {
+		return errors.New("WebView2 parent window is unavailable")
+	}
+	if err := viewsCOMCall(c.pointer, viewsControllerPutParentWindowSlot, parent); err != nil {
+		return err
+	}
+	actual, err := c.GetParentWindow()
+	if err != nil {
+		return fmt.Errorf("checking WebView2 parent window after reparent: %w", err)
+	}
+	if actual != parent {
+		return fmt.Errorf("WebView2 parent window is %#x after reparent, want %#x", actual, parent)
+	}
+	runtime.KeepAlive(c)
+	return nil
+}
+
+func (c *viewsController) GetBounds() (viewsRECT, error) {
+	if c == nil || c.pointer == nil {
+		return viewsRECT{}, errors.New("WebView2 controller is unavailable")
+	}
+	var bounds viewsRECT
+	err := viewsCOMCall(c.pointer, viewsControllerGetBoundsSlot, uintptr(unsafe.Pointer(&bounds)))
+	runtime.KeepAlive(&bounds)
+	runtime.KeepAlive(c)
+	if err != nil {
+		return viewsRECT{}, err
+	}
+	return bounds, nil
+}
+
 func (c *viewsController) MoveFocus(reason uintptr) error {
 	err := viewsCOMCall(c.pointer, viewsControllerMoveFocusSlot, reason)
+	runtime.KeepAlive(c)
+	return err
+}
+
+func (c *viewsController) AddMoveFocusRequested(handler *eventHandler) (int64, error) {
+	if c == nil || c.pointer == nil || handler == nil {
+		return 0, errors.New("WebView2 focus event registration is unavailable")
+	}
+	var token int64
+	err := viewsCOMCall(c.pointer, viewsControllerAddMoveFocusRequestedSlot,
+		uintptr(unsafe.Pointer(handler)), uintptr(unsafe.Pointer(&token)))
+	runtime.KeepAlive(handler)
+	runtime.KeepAlive(&token)
+	runtime.KeepAlive(c)
+	return token, err
+}
+
+func (c *viewsController) RemoveMoveFocusRequested(token int64) error {
+	if c == nil || c.pointer == nil {
+		return errors.New("WebView2 controller is unavailable")
+	}
+	err := viewsCOMCall(c.pointer, viewsControllerRemoveMoveFocusRequestedSlot, uintptr(token))
 	runtime.KeepAlive(c)
 	return err
 }
@@ -256,6 +347,27 @@ func viewsProcessFailedKind(args unsafe.Pointer) (uint32, error) {
 		return 0, err
 	}
 	return kind, nil
+}
+
+func viewsMoveFocusReason(args unsafe.Pointer) (uintptr, error) {
+	if args == nil {
+		return 0, errors.New("WebView2 focus event arguments are unavailable")
+	}
+	var reason uintptr
+	if err := viewsCOMCall(args, 3, uintptr(unsafe.Pointer(&reason))); err != nil {
+		return 0, err
+	}
+	runtime.KeepAlive(&reason)
+	return reason, nil
+}
+
+func viewsMoveFocusSetHandled(args unsafe.Pointer, handled bool) error {
+	if args == nil {
+		return errors.New("WebView2 focus event arguments are unavailable")
+	}
+	err := viewsCOMCall(args, 5, viewsBOOL(handled))
+	runtime.KeepAlive(args)
+	return err
 }
 
 type viewsControllerCompleted interface {
