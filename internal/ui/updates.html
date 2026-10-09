@@ -8,24 +8,25 @@
   <style>{{systemCSS}}</style>
 </head>
 <body>
-<a class="skip" href="#content">{{t .Locale "Skip to content"}}</a>
-<main class="shell flow" id="content">
+{{template "chrome" .Chrome}}
+<main class="shell flow app-content" id="content">
   <header class="mast updates-mast">
     <div class="updates-heading">
-      <div class="updates-crumb"><a href="/">{{t .Locale "Workspace"}}</a><span aria-hidden="true">/</span><span aria-current="page">{{t .Locale "Updates"}}</span></div>
       <h1>{{t .Locale "Updates"}}</h1>
       <p class="lede">{{t .Locale "Manual, verified updates of the Matagi executable. Opening this page and changing the channel contact nothing; only Check for updates and Download use the network."}}</p>
     </div>
-    <form class="locale-form btn-row" method="post" action="/settings/locale" id="ui-locale-form">
-      <input type="hidden" name="token" value="{{.Token}}">
-      <input type="hidden" name="returnTo" value="/updates">
-      <label class="vh" for="ui-locale">{{t .Locale "Language"}}</label>
-      <select id="ui-locale" name="locale">
-        <option value="en" {{if isLocale .Locale "en"}}selected{{end}}>English</option>
-        <option value="ja" {{if isLocale .Locale "ja"}}selected{{end}}>日本語</option>
-      </select>
-      <button class="btn quiet" type="submit" data-pending="{{t .Locale "Saving…"}}">{{t .Locale "Set language"}}</button>
-    </form>
+    {{if not .Chrome.PresenterAvailable}}
+      <form class="locale-form btn-row" method="post" action="/settings/locale" id="ui-locale-form">
+        <input type="hidden" name="token" value="{{.Token}}">
+        <input type="hidden" name="returnTo" value="/updates">
+        <label class="vh" for="ui-locale">{{t .Locale "Language"}}</label>
+        <select id="ui-locale" name="locale">
+          <option value="en" {{if isLocale .Locale "en"}}selected{{end}}>English</option>
+          <option value="ja" {{if isLocale .Locale "ja"}}selected{{end}}>日本語</option>
+        </select>
+        <button class="btn quiet" type="submit" data-pending="{{t .Locale "Saving…"}}">{{t .Locale "Set language"}}</button>
+      </form>
+    {{end}}
   </header>
   {{if .Error}}<p class="msg bad feedback" role="alert"><strong>{{t .Locale .ErrorHint}}</strong> <span class="id">{{.Error}}</span></p>{{end}}
   {{with .Upd}}
@@ -121,7 +122,7 @@
         (function () {
           var timer = setInterval(function () {
             if (document.hidden) return;
-            fetch(location.pathname, {cache: "no-store"}).then(function (r) { return r.ok ? r.text() : Promise.reject(r.status); }).then(function (html) {
+            fetch("/updates/refresh", {cache: "no-store"}).then(function (r) { return r.ok ? r.text() : Promise.reject(r.status); }).then(function (html) {
               var doc = new DOMParser().parseFromString(html, "text/html");
               var src = doc.getElementById("updates-region"), dst = document.getElementById("updates-region");
               if (!src || !dst) { clearInterval(timer); return; }

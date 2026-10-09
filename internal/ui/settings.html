@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="{{localeCode .Locale}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>{{t .Locale "Settings"}} · Matagi</title>
+  <style>{{systemCSS}}</style>
+</head>
+<body>
+{{template "chrome" .Chrome}}
+<main id="content" class="shell flow app-content">
+  <header class="mast settings-mast">
+    <div class="stack">
+      <h1>{{t .Locale "Settings"}}</h1>
+      <p class="lede">{{t .Locale "Matagi operator preferences."}}</p>
+    </div>
+  </header>
+  {{if .Error}}<p class="msg bad feedback" role="alert">{{.Error}}</p>{{end}}
+
+  <section class="section" aria-labelledby="language-heading">
+    <h2 id="language-heading">{{t .Locale "Language"}}</h2>
+    {{if .SettingsAvailable}}
+      <form class="settings-form" method="post" action="/settings/locale">
+        <input type="hidden" name="token" value="{{.Token}}">
+        <input type="hidden" name="returnTo" value="/settings">
+        <label class="field" for="ui-locale">{{t .Locale "Display language"}}
+          <select id="ui-locale" name="locale">
+            <option value="en" {{if isLocale .Locale "en"}}selected{{end}}>English</option>
+            <option value="ja" {{if isLocale .Locale "ja"}}selected{{end}}>日本語</option>
+          </select>
+        </label>
+        <button class="btn primary" type="submit">{{t .Locale "Set language"}}</button>
+      </form>
+    {{else}}
+      <p class="msg warn" role="status">{{t .Locale "Language preference settings are unavailable."}}</p>
+    {{end}}
+  </section>
+
+  <section class="section" aria-labelledby="layout-heading">
+    <h2 id="layout-heading">{{t .Locale "Saved service views"}}</h2>
+    <p class="prose">{{t .Locale "Saved views reopen as parked placeholders. Matagi does not load a saved address or ensure an endpoint until you choose Resume."}}</p>
+    {{if .LayoutResetAvailable}}
+      <form method="post" action="/presentation/reset" class="btn-row settings-reset">
+        <input type="hidden" name="token" value="{{.Token}}">
+        <button class="btn danger" type="submit">{{t .Locale "Reset saved layout"}}</button>
+      </form>
+    {{else}}
+      <p class="note" role="status">{{t .Locale "Saved layout controls are unavailable."}}</p>
+    {{end}}
+  </section>
+</main>
+</body>
+</html>

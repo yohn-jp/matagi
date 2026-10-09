@@ -10,10 +10,12 @@ import (
 	"errors"
 	"html/template"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/yohn-jp/matagi/internal/i18n"
+	"github.com/yohn-jp/matagi/internal/presentation"
 	"github.com/yohn-jp/matagi/internal/runtime"
 	"github.com/yohn-jp/matagi/internal/settings"
 )
@@ -27,38 +29,43 @@ type EndpointAdmitter interface {
 }
 
 type page struct {
-	State  *State
-	Error  string
-	Token  string
-	Locale i18n.Locale
+	State               *State
+	Error               string
+	Token               string
+	Locale              i18n.Locale
+	SelectedEnvironment string
+	Environment         *Environment
+	Chrome              chromeData
 }
 
 // Options injects Matagi-owned settings and update services into the local
 // operator surface.
 type Options struct {
-	Settings *settings.Store
-	Updates  Updates
+	Settings  *settings.Store
+	Updates   Updates
+	Presenter Presenter
 }
 
 // NewHandler serves Matagi's local HTML surface. It talks to the runtime only
-// through Client and delegates endpoint navigation admission to the desktop
-// shell after a successful ensure response.
+// through Client and preserves the existing admitted-redirect path until a
+// composed Presenter is supplied through NewHandlerWithOptions.
 func NewHandler(client *Client, admitter EndpointAdmitter) http.Handler {
 	return NewHandlerWithOptions(client, admitter, Options{})
 }
 
-// NewHandlerWithOptions serves the local operator surface with settings and
-// optional update services, preserving NewHandler for existing callers.
+// NewHandlerWithOptions serves the local operator surface with settings,
+// optional update services, and optional presentation coordination.
 func NewHandlerWithOptions(client *Client, admitter EndpointAdmitter, options Options) http.Handler {
-	return &handler{client: client, admitter: admitter, settings: options.Settings, updates: options.Updates, token: newFormToken()}
+	return &handler{client: client, admitter: admitter, settings: options.Settings, updates: options.Updates, presenter: options.Presenter, token: newFormToken()}
 }
 
 type handler struct {
-	client   *Client
-	admitter EndpointAdmitter
-	settings *settings.Store
-	updates  Updates
-	token    string
+	client    *Client
+	admitter  EndpointAdmitter
+	settings  *settings.Store
+	updates   Updates
+	presenter Presenter
+	token     string
 }
 
 func (h *handler) locale() i18n.Locale {
@@ -103,6 +110,77 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.index(w, r, "")
+	case "/workspace":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet, h.locale())
+			return
+		}
+		h.index(w, r, "")
+	case "/workspace/refresh":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet, h.locale())
+			return
+		}
+		h.indexActive(w, r, "", "workspace")
+	case "/service":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet, h.locale())
+			return
+		}
+		environmentID, selected := h.selectedIntegratedEnvironment()
+		if !selected {
+			http.Redirect(w, r, workspaceLocation(environmentID), http.StatusSeeOther)
+			return
+		}
+		h.indexActive(w, r, "", "service")
+	case "/service/refresh":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet, h.locale())
+			return
+		}
+		h.indexActive(w, r, "", "service")
+	case "/presentation":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet, h.locale())
+			return
+		}
+		h.presentationProjection(w)
+	case "/presentation/select":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost, h.locale())
+			return
+		}
+		h.selectView(w, r)
+	case "/presentation/move":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost, h.locale())
+			return
+		}
+		h.moveView(w, r)
+	case "/presentation/close":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost, h.locale())
+			return
+		}
+		h.closeView(w, r)
+	case "/presentation/resume":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost, h.locale())
+			return
+		}
+		h.resumeView(w, r)
+	case "/presentation/reset":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost, h.locale())
+			return
+		}
+		h.resetLayout(w, r)
+	case "/settings":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet, h.locale())
+			return
+		}
+		h.settingsPage(w, "")
 	case "/jinushi":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost, h.locale())
@@ -116,7 +194,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.showError(w, apiStatus(err), h.describeFailure(err))
 			return
 		}
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		http.Redirect(w, r, workspaceLocation(r.PostForm.Get("environmentId")), http.StatusSeeOther)
 	case "/settings/locale":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost, h.locale())
@@ -129,6 +207,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.updatesPage(w, r)
+	case "/updates/refresh":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet, h.locale())
+			return
+		}
+		h.updatesRefreshPage(w, r)
 	case "/updates/channel":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost, h.locale())
@@ -183,12 +267,19 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) index(w http.ResponseWriter, r *http.Request, message string) {
+	if !h.selectTrusted(w, TrustedWorkspace) {
+		return
+	}
+	h.indexActive(w, r, message, "workspace")
+}
+
+func (h *handler) indexActive(w http.ResponseWriter, r *http.Request, message, active string) {
 	state, err := h.client.GetState(r.Context())
 	if err != nil {
 		if message == "" {
 			message = h.describeFailure(err)
 		}
-		h.showError(w, http.StatusBadGateway, message)
+		h.renderStatus(w, http.StatusBadGateway, page{Error: bounded(message, maxErrorMessage), Token: h.token, Locale: h.locale(), Chrome: h.chrome(active)})
 		return
 	}
 	for i := range state.Environments {
@@ -205,7 +296,42 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request, message string) 
 			}
 		}
 	}
-	h.render(w, page{State: &state, Error: message, Token: h.token, Locale: h.locale()})
+	selectedEnvironment := selectedEnvironmentID(&state, r.URL.Query().Get("environmentId"))
+	var environment *Environment
+	for index := range state.Environments {
+		if state.Environments[index].ID == selectedEnvironment {
+			environment = &state.Environments[index]
+			break
+		}
+	}
+	locale := h.locale()
+	h.render(w, page{State: &state, Error: message, Token: h.token, Locale: locale, SelectedEnvironment: selectedEnvironment, Environment: environment, Chrome: h.chrome(active)})
+}
+
+func selectedEnvironmentID(state *State, requested string) string {
+	if state == nil || len(state.Environments) == 0 {
+		return ""
+	}
+	for _, environment := range state.Environments {
+		if environment.ID == requested {
+			return requested
+		}
+	}
+	return state.Environments[0].ID
+}
+
+func workspaceLocation(environmentID string) string {
+	if environmentID == "" {
+		return "/"
+	}
+	return "/?environmentId=" + url.QueryEscape(environmentID)
+}
+
+func serviceLocation(environmentID string) string {
+	if environmentID == "" {
+		return "/service"
+	}
+	return "/service?environmentId=" + url.QueryEscape(environmentID)
 }
 
 func (h *handler) register(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +371,7 @@ func (h *handler) addService(w http.ResponseWriter, r *http.Request) {
 		h.index(w, r, h.describeFailure(err))
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, workspaceLocation(req.EnvironmentID), http.StatusSeeOther)
 }
 
 func (h *handler) describeFailure(err error) string {
@@ -356,7 +482,7 @@ func (h *handler) action(w http.ResponseWriter, r *http.Request) {
 		h.showError(w, apiStatus(err), h.describeActionFailure(err))
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, workspaceLocation(envID), http.StatusSeeOther)
 }
 
 func (h *handler) open(w http.ResponseWriter, r *http.Request) {
@@ -369,61 +495,161 @@ func (h *handler) open(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, h.locale().T("An environment, service, and endpoint are required."), http.StatusBadRequest)
 		return
 	}
+	h.openEndpoint(w, r, presentation.EndpointKey{EnvironmentID: request.EnvironmentID, ServiceID: request.ServiceID, EndpointID: request.EndpointID}, r.PostForm.Get("location"))
+}
+
+func (h *handler) openEndpoint(w http.ResponseWriter, r *http.Request, key presentation.EndpointKey, requestedLocation string) {
+	initial := presentation.LocationTab
+	switch requestedLocation {
+	case "", string(presentation.LocationTab):
+	case string(presentation.LocationWindow):
+		initial = presentation.LocationWindow
+	default:
+		http.Error(w, h.locale().T("Choose a valid view location."), http.StatusBadRequest)
+		return
+	}
+	if h.presenter == nil {
+		if initial != presentation.LocationTab {
+			h.presentationUnavailable(w)
+			return
+		}
+		h.openLegacyEndpoint(w, r, key)
+		return
+	}
+	reservation, err := h.presenter.ReserveOpen(key, initial)
+	if err != nil || reservation.View.ID == 0 || reservation.View.Key != key {
+		h.presentationFailure(w)
+		return
+	}
+	if !reservation.Ensure {
+		if err := h.presenter.Select(reservation.View.ID); err != nil {
+			h.presentationFailure(w)
+			return
+		}
+		http.Redirect(w, r, viewLocation(reservation.View.Location, key.EnvironmentID), http.StatusSeeOther)
+		return
+	}
+	request := EndpointRequest{EnvironmentID: key.EnvironmentID, ServiceID: key.ServiceID, EndpointID: key.EndpointID}
 	result, err := h.client.EnsureEndpoint(r.Context(), request)
+	if err != nil {
+		h.presenter.FailOpen(reservation)
+		h.showError(w, apiStatus(err), h.describeFailure(err))
+		return
+	}
+	endpoint := result.Endpoint
+	if endpoint.ID != key.EndpointID {
+		h.presenter.FailOpen(reservation)
+		h.showError(w, http.StatusBadGateway, h.locale().T("The ensured endpoint did not match the requested endpoint."))
+		return
+	}
+	if endpoint.EndpointState != "available" || endpoint.TunnelState != "ready" {
+		message := h.diagnosticHint(endpoint.Failure)
+		if message == "" {
+			message = h.locale().T("The endpoint is not locally available.")
+		}
+		h.presenter.FailOpen(reservation)
+		h.showError(w, http.StatusBadGateway, message)
+		return
+	}
+	if _, err := LoopbackHTTPOrigin(endpoint.LocalURL); err != nil {
+		h.presenter.FailOpen(reservation)
+		h.showError(w, http.StatusBadGateway, h.locale().T("The ensured endpoint did not return a permitted loopback URL."))
+		return
+	}
+	if err := h.presenter.CompleteOpen(reservation, endpoint.LocalURL); err != nil {
+		h.presenter.FailOpen(reservation)
+		h.presentationFailure(w)
+		return
+	}
+	if err := h.presenter.Select(reservation.View.ID); err != nil {
+		h.presentationFailure(w)
+		return
+	}
+	http.Redirect(w, r, viewLocation(reservation.View.Location, key.EnvironmentID), http.StatusSeeOther)
+}
+
+// openLegacyEndpoint preserves the pre-composition production path until #83
+// injects Presenter. The endpoint URL still comes only from a successful
+// ensure response, is admitted by the existing policy, and is never read from
+// the browser request.
+func (h *handler) openLegacyEndpoint(w http.ResponseWriter, r *http.Request, key presentation.EndpointKey) {
+	if h.admitter == nil {
+		h.showError(w, http.StatusBadGateway, h.locale().T("The desktop navigation policy is unavailable."))
+		return
+	}
+	result, err := h.client.EnsureEndpoint(r.Context(), EndpointRequest{EnvironmentID: key.EnvironmentID, ServiceID: key.ServiceID, EndpointID: key.EndpointID})
 	if err != nil {
 		h.showError(w, apiStatus(err), h.describeFailure(err))
 		return
 	}
 	endpoint := result.Endpoint
-	if endpoint.ID != request.EndpointID {
+	if endpoint.ID != key.EndpointID {
 		h.showError(w, http.StatusBadGateway, h.locale().T("The ensured endpoint did not match the requested endpoint."))
 		return
 	}
 	if endpoint.EndpointState != "available" || endpoint.TunnelState != "ready" {
-		message := endpoint.Failure
+		message := h.diagnosticHint(endpoint.Failure)
 		if message == "" {
 			message = h.locale().T("The endpoint is not locally available.")
 		}
-		h.showError(w, http.StatusBadGateway, bounded(message, maxErrorMessage))
+		h.showError(w, http.StatusBadGateway, message)
 		return
 	}
-	if h.admitter == nil {
-		h.showError(w, http.StatusBadGateway, h.locale().T("The desktop navigation policy is unavailable."))
+	if _, err := LoopbackHTTPOrigin(endpoint.LocalURL); err != nil {
+		h.showError(w, http.StatusBadGateway, h.locale().T("The ensured endpoint did not return a permitted loopback URL."))
 		return
 	}
 	if err := h.admitter.AdmitEnsuredEndpoint(endpoint.LocalURL); err != nil {
 		h.showError(w, http.StatusBadGateway, h.locale().T("The ensured endpoint did not return a permitted loopback URL."))
 		return
 	}
-	// The destination comes only from the successful ensure response after the
-	// desktop policy has admitted its loopback origin.
 	http.Redirect(w, r, endpoint.LocalURL, http.StatusSeeOther)
 }
 
 func (h *handler) showError(w http.ResponseWriter, status int, message string) {
-	h.renderStatus(w, status, page{Error: bounded(message, maxErrorMessage), Token: h.token, Locale: h.locale()})
+	if !h.selectTrusted(w, TrustedWorkspace) {
+		return
+	}
+	h.renderStatus(w, status, page{Error: bounded(message, maxErrorMessage), Token: h.token, Locale: h.locale(), Chrome: h.chrome("workspace")})
 }
 
 func (h *handler) setLocale(w http.ResponseWriter, r *http.Request) {
+	returnTo := localeReturnTo(r.PostForm.Get("returnTo"))
 	selected := r.PostForm.Get("locale")
 	if !i18n.Valid(selected) {
-		h.showError(w, http.StatusBadRequest, h.locale().T("Choose English or Japanese."))
+		h.localeError(w, http.StatusBadRequest, returnTo, h.locale().T("Choose English or Japanese."))
 		return
 	}
 	if h.settings == nil {
-		h.showError(w, http.StatusServiceUnavailable, h.locale().T("Language preference settings are unavailable."))
+		h.localeError(w, http.StatusServiceUnavailable, returnTo, h.locale().T("Language preference settings are unavailable."))
 		return
 	}
 	if err := h.settings.SetLocale(selected); err != nil {
 		evidence := bounded(err.Error(), maxErrorMessage-100)
-		h.showError(w, http.StatusInternalServerError, h.locale().T("The language preference could not be saved.")+" "+evidence)
+		h.localeError(w, http.StatusInternalServerError, returnTo, h.locale().T("The language preference could not be saved.")+" "+evidence)
 		return
 	}
-	returnTo := r.PostForm.Get("returnTo")
-	if returnTo != "/updates" {
-		returnTo = "/"
-	}
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
+}
+
+func localeReturnTo(value string) string {
+	switch value {
+	case "/settings", "/updates":
+		return value
+	default:
+		return "/"
+	}
+}
+
+func (h *handler) localeError(w http.ResponseWriter, status int, returnTo, message string) {
+	switch returnTo {
+	case "/settings":
+		h.renderSettingsStatus(w, status, message)
+	case "/updates":
+		h.renderUpdatesStatus(w, status, message)
+	default:
+		h.showError(w, status, message)
+	}
 }
 
 func apiStatus(err error) int {
@@ -516,7 +742,13 @@ func templateFuncs() template.FuncMap {
 			}
 			return label
 		},
+		"viewState": func(locale i18n.Locale, state presentation.ViewState) string {
+			return locale.T(viewStateMessage(state))
+		},
+		"viewPlaceholder": func(locale i18n.Locale, state presentation.ViewState) string {
+			return locale.T(viewPlaceholderMessage(state))
+		},
 	}
 }
 
-var pageTemplate = template.Must(template.New("matagi").Funcs(templateFuncs()).Parse(pageHTML))
+var pageTemplate = mustParseTemplates("matagi", pageHTML, templateFuncs(), chromeHTML)
