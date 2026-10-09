@@ -10,20 +10,27 @@ import (
 // ViewHandle is an opaque, process-local identity for one WebView2 controller.
 type ViewHandle string
 
-// ViewCallbacks report controller lifecycle changes. They are invoked outside
-// the WebView2 STA and never contain COM objects or native window handles.
+// ViewCallbacks report controller lifecycle changes and detached-window
+// actions. They are invoked outside the WebView2 STA and never contain COM
+// objects or native window handles.
 type ViewCallbacks struct {
-	Ready  func(ViewHandle)
-	Failed func(ViewHandle, error)
-	Closed func(ViewHandle)
+	Ready          func(ViewHandle)
+	Failed         func(ViewHandle, error)
+	Closed         func(ViewHandle)
+	ReturnToTabs   func(ViewHandle)
+	CloseRequested func(ViewHandle)
 }
 
-// ViewConfig contains only the URL admitted for this controller, its isolated
-// WebView2 user-data folder, and its origin policy.
+// ViewConfig contains the URL admitted for this controller, its isolated
+// WebView2 user-data folder, origin policy, and optional detached-window
+// title/control labels for a composition layer to localize.
 type ViewConfig struct {
-	URL           string
-	ProfileFolder string
-	Policy        NavigationPolicy
+	URL               string
+	ProfileFolder     string
+	Policy            NavigationPolicy
+	WindowTitle       string
+	ReturnToTabsLabel string
+	CloseViewLabel    string
 }
 
 // DIPBounds uses device-independent pixels for native window placement.
@@ -60,9 +67,8 @@ var ErrViewsHostStopped = errors.New("WebView2 host message loop stopped")
 
 var ErrTrustedViewOwned = errors.New("the trusted Matagi view is owned by the host")
 
-// ErrViewMoveDeferred marks the move operation reserved for the detached-view
-// integration leaf. The host exposes the frozen seam while integrated views
-// remain the only supported location in this leaf.
+// ErrViewMoveDeferred is retained for compatibility with callers that used the
+// initial multiview host before transactional movement was implemented.
 var ErrViewMoveDeferred = errors.New("detached view movement is not available")
 
 // ViewPolicy allows exactly one loopback HTTP origin. A trusted policy admits

@@ -69,6 +69,8 @@ type nativeViewsHost struct {
 	selected    ViewHandle
 	closing     bool
 	root        uintptr
+	instance    windows.Handle
+	staThreadID uint32
 	activateMsg uint32
 
 	commandMu sync.Mutex
@@ -115,7 +117,17 @@ type nativeView struct {
 	processFailedHandler  *eventHandler
 	processFailedToken    int64
 	processFailedAttached bool
+	moveFocusHandler      *eventHandler
+	moveFocusToken        int64
+	moveFocusAttached     bool
 	parentWindow          uintptr
+	location              ViewLocation
+	detachedWindow        uintptr
+	returnButton          uintptr
+	closeButton           uintptr
+	windowBounds          DIPBounds
+	controllerBounds      viewsRECT
+	destroyingDetached    bool
 	controllerClosed      bool
 }
 
@@ -142,6 +154,8 @@ const (
 	viewEventReady uint8 = iota + 1
 	viewEventFailed
 	viewEventClosed
+	viewEventReturnToTabs
+	viewEventCloseRequested
 )
 
 type viewsEnvironmentHandler struct {
@@ -329,6 +343,18 @@ func (h *nativeViewsHost) deliverCallback(event viewCallbackEvent) {
 		if callbacks.Closed != nil {
 			callbacks.Closed(handle)
 		}
+	case viewEventReturnToTabs:
+		if callbacks.ReturnToTabs != nil {
+			callbacks.ReturnToTabs(handle)
+		} else if err := h.Move(context.Background(), handle, ViewIntegrated, DIPBounds{}); err != nil {
+			fmt.Fprintf(os.Stderr, "Matagi: returning WebView2 view to tabs failed: %v\n", err)
+		}
+	case viewEventCloseRequested:
+		if callbacks.CloseRequested != nil {
+			callbacks.CloseRequested(handle)
+		} else if err := h.Close(context.Background(), handle); err != nil {
+			fmt.Fprintf(os.Stderr, "Matagi: closing WebView2 view failed: %v\n", err)
+		}
 	}
 }
 
@@ -368,14 +394,19 @@ func (h *nativeViewsHost) run(initial *nativeView) {
 		return
 	}
 
-	instance, ownsClass, err := registerViewsWindowClass()
+	instance, ownsRootClass, ownsDetachedClass, err := registerViewsWindowClass()
 	if err != nil {
 		h.started <- err
 		return
 	}
-	if ownsClass {
+	if ownsRootClass {
 		defer procUnregisterClassW.Call(uintptr(unsafe.Pointer(mustUTF16(windowClass))), uintptr(instance))
 	}
+	if ownsDetachedClass {
+		defer procUnregisterClassW.Call(uintptr(unsafe.Pointer(mustUTF16(detachedWindowClass))), uintptr(instance))
+	}
+	h.instance = instance
+	h.staThreadID = windows.GetCurrentThreadId()
 
 	userID, err := currentUserID()
 	if err != nil {
@@ -448,34 +479,51 @@ func (h *nativeViewsHost) run(initial *nativeView) {
 			h.mu.Unlock()
 			return
 		}
+		if h.preTranslateDetachedMessage(&message) {
+			continue
+		}
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&message)))
 		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&message)))
 	}
 }
 
-func registerViewsWindowClass() (windows.Handle, bool, error) {
+func registerViewsWindowClass() (windows.Handle, bool, bool, error) {
 	wndProcOnce.Do(func() { wndProcCallback = windows.NewCallback(windowProc) })
 	var instance windows.Handle
 	if err := windows.GetModuleHandleEx(0, nil, &instance); err != nil {
-		return 0, false, fmt.Errorf("locating the application module: %w", err)
+		return 0, false, false, fmt.Errorf("locating the application module: %w", err)
 	}
-	className := mustUTF16(windowClass)
 	cursor, _, _ := procLoadCursorW.Call(0, idcArrow)
-	wc := wndClassEx{
-		WndProc:    wndProcCallback,
-		Instance:   instance,
-		Cursor:     windows.Handle(cursor),
-		Background: windows.Handle(colorWindow + 1),
-		ClassName:  className,
-	}
-	wc.Size = uint32(unsafe.Sizeof(wc))
-	if registered, _, callErr := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); registered == 0 {
-		if callErr == syscall.Errno(1410) {
-			return instance, false, nil
+	register := func(name string) (bool, error) {
+		className := mustUTF16(name)
+		wc := wndClassEx{
+			WndProc:    wndProcCallback,
+			Instance:   instance,
+			Cursor:     windows.Handle(cursor),
+			Background: windows.Handle(colorWindow + 1),
+			ClassName:  className,
 		}
-		return 0, false, fmt.Errorf("registering the WebView2 host window class: %w", callErr)
+		wc.Size = uint32(unsafe.Sizeof(wc))
+		if registered, _, callErr := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); registered == 0 {
+			if callErr == syscall.Errno(1410) {
+				return false, nil
+			}
+			return false, fmt.Errorf("registering window class %s: %w", name, callErr)
+		}
+		return true, nil
 	}
-	return instance, true, nil
+	root, err := register(windowClass)
+	if err != nil {
+		return 0, false, false, err
+	}
+	detached, err := register(detachedWindowClass)
+	if err != nil {
+		if root {
+			procUnregisterClassW.Call(uintptr(unsafe.Pointer(mustUTF16(windowClass))), uintptr(instance))
+		}
+		return 0, false, false, err
+	}
+	return instance, root, detached, nil
 }
 
 func mustUTF16(value string) *uint16 {
@@ -496,18 +544,33 @@ func (h *nativeViewsHost) windowProc(hwnd uintptr, owner viewWindowOwner, messag
 		return 0
 	case wmDPIChanged:
 		applyDPIChange(hwnd, lParam)
+		if owner.view != nil {
+			h.layoutDetachedControls(owner.view, hwnd)
+		}
 		h.resizeViews(hwnd)
 		return 0
+	case wmGetMinMaxInfo:
+		if owner.view != nil {
+			enforceDetachedWindowMinimum(hwnd, lParam)
+			return 0
+		}
 	case wmSize:
+		if owner.view != nil {
+			h.layoutDetachedControls(owner.view, hwnd)
+		}
 		h.resizeViews(hwnd)
 		return 0
+	case wmCommand:
+		if owner.view != nil && h.handleDetachedCommand(hwnd, owner.view, wParam, lParam) {
+			return 0
+		}
 	case wmClose:
 		if hwnd == h.root {
 			h.closeAllOnSTA()
 			return 0
 		}
 		if owner.view != nil {
-			h.closeViewOnSTA(owner.view)
+			h.queueCallback(viewCallbackEvent{state: owner.view.callbackState, kind: viewEventCloseRequested})
 			return 0
 		}
 	case wmDestroy:
@@ -517,6 +580,12 @@ func (h *nativeViewsHost) windowProc(hwnd uintptr, owner viewWindowOwner, messag
 			h.root = 0
 			h.mu.Unlock()
 			procPostQuitMessage.Call(0)
+		} else if owner.view != nil && owner.view.detachedWindow == hwnd && !owner.view.destroyingDetached && !owner.view.closed {
+			owner.view.detachedWindow = 0
+			owner.view.returnButton = 0
+			owner.view.closeButton = 0
+			h.cancelViewOnSTA(owner.view)
+			h.closeViewOnSTA(owner.view)
 		}
 		return 0
 	}
@@ -634,17 +703,13 @@ func (h *nativeViewsHost) Move(ctx context.Context, handle ViewHandle, target Vi
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	h.mu.Lock()
-	_, exists := h.views[handle]
-	h.mu.Unlock()
-	if !exists {
-		return errors.New("unknown WebView2 view handle")
-	}
 	if target != ViewIntegrated && target != ViewDetached {
 		return errors.New("invalid WebView2 view location")
 	}
-	_ = bounds
-	return ErrViewMoveDeferred
+	if err := validateViewMoveBounds(target, bounds); err != nil {
+		return err
+	}
+	return h.invoke(ctx, false, func() error { return h.moveOnSTA(ctx, handle, target, bounds) })
 }
 
 func (h *nativeViewsHost) Close(ctx context.Context, handle ViewHandle) error {
@@ -1015,6 +1080,18 @@ func (h *nativeViewsHost) initializeController(v *nativeView) error {
 	v.processFailedHandler = processFailedHandler
 	v.processFailedToken = token
 	v.processFailedAttached = true
+	if !v.trusted {
+		moveFocusHandler := newEventHandler(iidViewsMoveFocusEH, func(args unsafe.Pointer) {
+			h.moveFocusRequested(v, args)
+		})
+		moveFocusToken, err := v.controller.AddMoveFocusRequested(moveFocusHandler)
+		if err != nil {
+			return fmt.Errorf("monitoring WebView2 keyboard focus requests: %w", err)
+		}
+		v.moveFocusHandler = moveFocusHandler
+		v.moveFocusToken = moveFocusToken
+		v.moveFocusAttached = true
+	}
 	v.parentWindow = h.root
 	if err := h.setBounds(v); err != nil {
 		return err
@@ -1036,10 +1113,14 @@ func (h *nativeViewsHost) selectOnSTA(handle ViewHandle) error {
 		h.mu.Unlock()
 		return ErrViewNotReady
 	}
+	if v.location == ViewDetached {
+		h.mu.Unlock()
+		return h.focusOnSTA(handle)
+	}
 	previous := h.selected
 	views := make([]*nativeView, 0, len(h.views))
 	for _, candidate := range h.views {
-		if candidate.ready && !candidate.trusted {
+		if candidate.ready && !candidate.trusted && candidate.location == ViewIntegrated {
 			views = append(views, candidate)
 		}
 	}
@@ -1084,7 +1165,7 @@ func (h *nativeViewsHost) selectOnSTA(handle ViewHandle) error {
 func (h *nativeViewsHost) restoreSelectionOnSTA(handle ViewHandle, views []*nativeView, trusted *nativeView) error {
 	var restoreErr error
 	for _, candidate := range views {
-		visible := candidate.handle == handle && !candidate.trusted
+		visible := candidate.handle == handle && !candidate.trusted && candidate.location == ViewIntegrated
 		if err := candidate.controller.PutIsVisible(visible); err != nil {
 			restoreErr = errors.Join(restoreErr, fmt.Errorf("restoring WebView2 sibling visibility: %w", err))
 		}
@@ -1138,6 +1219,10 @@ func (h *nativeViewsHost) focusOnSTA(handle ViewHandle) error {
 	h.mu.Lock()
 	v := h.views[handle]
 	root := h.root
+	detached := uintptr(0)
+	if v != nil && v.location == ViewDetached {
+		detached = v.detachedWindow
+	}
 	h.mu.Unlock()
 	if v == nil {
 		return errors.New("unknown WebView2 view handle")
@@ -1145,15 +1230,13 @@ func (h *nativeViewsHost) focusOnSTA(handle ViewHandle) error {
 	if !v.ready || v.controller == nil {
 		return ErrViewNotReady
 	}
+	if detached != 0 {
+		return focusWebViewWindow(detached, v.controller)
+	}
 	if err := h.selectOnSTA(handle); err != nil {
 		return err
 	}
-	procShowWindow.Call(root, swShowNormal)
-	if activated, _, err := procSetForegroundW.Call(root); activated == 0 {
-		return fmt.Errorf("activating Matagi view host window: %w", err)
-	}
-	viewsSetFocus.Call(root)
-	return v.controller.MoveFocus(0)
+	return focusWebViewWindow(root, v.controller)
 }
 
 func (h *nativeViewsHost) closeAllOnSTA() {
@@ -1190,7 +1273,22 @@ func (h *nativeViewsHost) closeViewOnSTA(v *nativeView) {
 		_ = trusted.controller.PutIsVisible(true)
 	}
 	h.closeControllerOnSTA(v)
+	if v.detachedWindow != 0 {
+		if err := h.destroyDetachedWindow(v, v.detachedWindow); err != nil {
+			v.closeErr = errors.Join(v.closeErr, fmt.Errorf("destroying detached WebView2 window: %w", err))
+		}
+	}
 	h.finishViewClose(v, v.closeErr)
+}
+
+func (h *nativeViewsHost) cancelViewOnSTA(v *nativeView) {
+	if v == nil {
+		return
+	}
+	h.mu.Lock()
+	v.cancelled = true
+	h.syncCallbackState(v)
+	h.mu.Unlock()
 }
 
 func (h *nativeViewsHost) closeControllerOnSTA(v *nativeView) {
@@ -1210,6 +1308,12 @@ func (h *nativeViewsHost) closeControllerOnSTA(v *nativeView) {
 		}
 		v.processFailedAttached = false
 	}
+	if v.moveFocusAttached {
+		if err := v.controller.RemoveMoveFocusRequested(v.moveFocusToken); err != nil {
+			v.closeErr = errors.Join(v.closeErr, fmt.Errorf("removing WebView2 keyboard focus handler: %w", err))
+		}
+		v.moveFocusAttached = false
+	}
 	if err := v.controller.Close(); err != nil {
 		v.closeErr = errors.Join(v.closeErr, fmt.Errorf("closing WebView2 controller: %w", err))
 	}
@@ -1226,6 +1330,7 @@ func (h *nativeViewsHost) closeControllerOnSTA(v *nativeView) {
 	runtime.KeepAlive(guard)
 	v.guard = nil
 	v.processFailedHandler = nil
+	v.moveFocusHandler = nil
 }
 
 func (h *nativeViewsHost) finishViewClose(v *nativeView, err error) {
@@ -1411,7 +1516,11 @@ func (h *nativeViewsHost) resizeViews(hwnd uintptr) {
 	for _, v := range views {
 		bounds := viewsRECT{Left: 0, Top: 0, Right: width, Bottom: height}
 		if !v.trusted {
-			bounds.Top = scaleForDPI(chromeHeightDIP, dpi)
+			headerHeight := chromeHeightDIP
+			if v.location == ViewDetached {
+				headerHeight = detachedToolbarHeightDIP
+			}
+			bounds.Top = scaleForDPI(headerHeight, dpi)
 			if bounds.Bottom < bounds.Top {
 				bounds.Bottom = bounds.Top
 			}
@@ -1420,6 +1529,7 @@ func (h *nativeViewsHost) resizeViews(hwnd uintptr) {
 			h.failView(v, fmt.Errorf("resizing WebView2 controller: %w", err))
 			continue
 		}
+		v.controllerBounds = bounds
 		if err := v.controller.NotifyParentWindowPositionChanged(); err != nil {
 			h.failView(v, fmt.Errorf("notifying WebView2 controller of parent position: %w", err))
 		}
@@ -1427,14 +1537,21 @@ func (h *nativeViewsHost) resizeViews(hwnd uintptr) {
 }
 
 func (h *nativeViewsHost) setBounds(v *nativeView) error {
-	var rect dpiRect
-	if ok, _, err := viewsGetClientRect.Call(h.root, uintptr(unsafe.Pointer(&rect))); ok == 0 {
-		return fmt.Errorf("reading Matagi view host bounds: %w", err)
+	if v.parentWindow == 0 {
+		return errors.New("WebView2 parent window is unavailable")
 	}
-	dpi := viewWindowDPI(h.root)
+	var rect dpiRect
+	if ok, _, err := viewsGetClientRect.Call(v.parentWindow, uintptr(unsafe.Pointer(&rect))); ok == 0 {
+		return fmt.Errorf("reading WebView2 parent bounds: %w", err)
+	}
+	dpi := viewWindowDPI(v.parentWindow)
 	bounds := viewsRECT{Left: 0, Top: 0, Right: rect.right - rect.left, Bottom: rect.bottom - rect.top}
 	if !v.trusted {
-		bounds.Top = scaleForDPI(chromeHeightDIP, dpi)
+		headerHeight := chromeHeightDIP
+		if v.location == ViewDetached {
+			headerHeight = detachedToolbarHeightDIP
+		}
+		bounds.Top = scaleForDPI(headerHeight, dpi)
 		if bounds.Bottom < bounds.Top {
 			bounds.Bottom = bounds.Top
 		}
@@ -1445,6 +1562,7 @@ func (h *nativeViewsHost) setBounds(v *nativeView) error {
 	if err := v.controller.NotifyParentWindowPositionChanged(); err != nil {
 		return fmt.Errorf("updating WebView2 parent position: %w", err)
 	}
+	v.controllerBounds = bounds
 	return nil
 }
 
