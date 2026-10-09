@@ -339,9 +339,8 @@ func TestWindowsControllerMovePreservesTypedPageAndControllerIdentity(t *testing
 	if got := navigations.Load(); got != 1 {
 		t.Fatalf("page navigation count after detach = %d, want one initial navigation", got)
 	}
-	if _, _, err := testSendMessageW.Call(detached.detachedWindow, wmCommand, commandReturnToTabs, detached.returnButton); err != nil {
-		t.Fatalf("requesting native Return to tabs: %v", err)
-	}
+	// WM_COMMAND is handled with LRESULT 0; syscall.Call reports ERROR_SUCCESS as a non-nil error.
+	testSendMessageW.Call(detached.detachedWindow, wmCommand, commandReturnToTabs, detached.returnButton)
 	select {
 	case callbackThread := <-returned:
 		if callbackThread == 0 {
@@ -377,9 +376,7 @@ func TestWindowsControllerMovePreservesTypedPageAndControllerIdentity(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := testSendMessageW.Call(closeSnapshot.detachedWindow, wmCommand, commandCloseView, closeSnapshot.closeButton); err != nil {
-		t.Fatalf("requesting native Close view: %v", err)
-	}
+	testSendMessageW.Call(closeSnapshot.detachedWindow, wmCommand, commandCloseView, closeSnapshot.closeButton)
 	waitNativeViewEvent(t, ctx, events, "closed")
 	select {
 	case <-host.done:
@@ -656,9 +653,7 @@ func TestWindowsDetachedWMCloseAndDestroyOnlyCloseTheirView(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := testSendMessageW.Call(closeSnapshot.detachedWindow, wmClose, 0, 0); err != nil {
-		t.Fatalf("sending detached WM_CLOSE: %v", err)
-	}
+	testSendMessageW.Call(closeSnapshot.detachedWindow, wmClose, 0, 0)
 	waitNativeViewEvent(t, ctx, closeEvents, "closed")
 	select {
 	case <-host.done:
@@ -755,6 +750,15 @@ func TestWindowsShutdownDuringControllerMoveRollsBackThenClosesOnce(t *testing.T
 			focusPrevious:   func() error { return focusWebViewWindow(host.root, viewEntry.controller) },
 			restorePeers: func() error {
 				return host.restoreSelectionOnSTA(previousSelected, host.integratedViewsOnSTA(), trusted)
+			},
+			cancelled: func() error {
+				host.mu.Lock()
+				closing := host.closing || viewEntry.cancelled || viewEntry.closed
+				host.mu.Unlock()
+				if closing {
+					return errors.New("WebView2 view move was cancelled")
+				}
+				return nil
 			},
 			cleanupTarget:   func() error { return host.destroyDetachedWindowHandle(viewEntry, target.window) },
 			closeController: func() error { return host.closeMoveResourcesOnSTA(viewEntry, 0, target.window) },
