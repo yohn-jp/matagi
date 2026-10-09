@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yohn-jp/matagi/internal/config"
+	"github.com/yohn-jp/matagi/internal/health"
 	"github.com/yohn-jp/matagi/internal/jinushi"
 	"github.com/yohn-jp/matagi/internal/registry"
 	"github.com/yohn-jp/matagi/internal/ssh"
@@ -120,6 +121,7 @@ func TestClassifyLifecycleFailuresKeepsAuthorityBoundaries(t *testing.T) {
 		},
 		{name: "Jinushi unavailable", err: &jinushi.Failure{Kind: jinushi.KindSupervisorUnavailable}, want: "jinushi-unavailable"},
 		{name: "Jinushi command rejection", err: &jinushi.Failure{Kind: jinushi.KindCommand, Code: "invalid-run"}, want: "jinushi-command-failed", wantEvidence: "invalid-run"},
+		{name: "token-like Jinushi code is not evidence", err: &jinushi.Failure{Kind: jinushi.KindCommand, Code: "bearer-secret-abc123"}, want: "jinushi-command-failed"},
 		{name: "unsafe Jinushi code is not evidence", err: &jinushi.Failure{Kind: jinushi.KindCommand, Code: "path /srv/private"}, want: "jinushi-command-failed"},
 		{name: "Jinushi protocol failure", err: &jinushi.Failure{Kind: jinushi.KindProtocol}, want: "jinushi-protocol-failed"},
 		{name: "ambiguous lifecycle evidence", err: &jinushi.Failure{Kind: jinushi.KindAmbiguous}, want: "lifecycle-conflict"},
@@ -131,6 +133,103 @@ func TestClassifyLifecycleFailuresKeepsAuthorityBoundaries(t *testing.T) {
 				t.Fatalf("classify() = %v, want code %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestRuntimeStateProjectsOnlyStableFailureDiagnostics(t *testing.T) {
+	r, _ := fixture(t)
+	defer r.Close(context.Background())
+
+	s := r.services[key("env", "svc")]
+	view := r.serviceView(s, health.ServiceObservation{
+		ID:             string(s.ID),
+		Process:        health.ProcessUnknown,
+		ProcessError:   "host-unreachable",
+		ReadinessError: "bearer-secret-abc123",
+		Endpoints: []health.EndpointObservation{{
+			ID:    "ui",
+			State: health.EndpointError,
+			Error: endpointEvidenceMissing,
+		}},
+	})
+	if view.ProcessError != "host-unreachable" {
+		t.Fatalf("process diagnostic = %q; want stable SSH classification", view.ProcessError)
+	}
+	if view.ReadinessError != "remote-failure" {
+		t.Fatalf("untrusted readiness diagnostic = %q; want safe fallback", view.ReadinessError)
+	}
+	if view.Endpoints[1].Failure != "endpoint-evidence-missing" {
+		t.Fatalf("endpoint diagnostic = %q; want stable endpoint classification", view.Endpoints[1].Failure)
+	}
+}
+
+func TestPollPreservesUnreachableConnectivityAndSafeEnvironmentReason(t *testing.T) {
+	r, f := fixture(t)
+	defer r.Close(context.Background())
+	const secret = "ssh transport detail bearer-secret-abc123"
+	f.fn = func(args []string) (ssh.Result, error) {
+		if len(args) == 1 && args[0] == "true" {
+			return ssh.Result{}, &ssh.Error{Kind: ssh.FailureTransport, Err: errors.New(secret)}
+		}
+		return ssh.Result{Stdout: []byte(`{"version":1,"status":{}}`)}, nil
+	}
+	if err := r.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll(): %v", err)
+	}
+	environment := r.Snapshot().Environments[0]
+	if environment.Connectivity != health.ConnectivityUnreachable || environment.Error != "host-unreachable" || strings.Contains(environment.Error, secret) {
+		t.Fatalf("transport failure state = %#v; want unreachable with safe host reason", environment)
+	}
+}
+
+func TestPollClassifiesSSHRemoteCommandConnectivityFailure(t *testing.T) {
+	r, f := fixture(t)
+	defer r.Close(context.Background())
+	f.fn = func(args []string) (ssh.Result, error) {
+		if len(args) == 1 && args[0] == "true" {
+			return ssh.Result{ExitCode: 1}, &ssh.Error{Kind: ssh.FailureRemoteCommand, Err: errors.New("remote stderr bearer-secret-abc123")}
+		}
+		return ssh.Result{Stdout: []byte(`{"version":1,"status":{}}`)}, nil
+	}
+	if err := r.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll(): %v", err)
+	}
+	environment := r.Snapshot().Environments[0]
+	if environment.Connectivity != health.ConnectivityError || environment.Error != "ssh-connectivity-failed" {
+		t.Fatalf("remote command failure = %#v; want same error state with SSH connectivity classification", environment)
+	}
+}
+
+func TestPollProjectsJinushiFailureWithoutChangingConnectedStateAndClearsOnRecovery(t *testing.T) {
+	r, f := fixture(t)
+	defer r.Close(context.Background())
+	failed := true
+	f.fn = func(args []string) (ssh.Result, error) {
+		if len(args) == 1 && args[0] == "true" {
+			return ssh.Result{ExitCode: 0}, nil
+		}
+		if len(args) > 1 && args[1] == "status" && failed {
+			return ssh.Result{Stdout: []byte(`{"version":1,"error":{"code":"supervisor-unavailable","message":"private stderr bearer-secret-abc123"}}`)}, nil
+		}
+		if len(args) > 1 && args[1] == "list" {
+			return ssh.Result{Stdout: []byte(`{"version":1,"runs":[],"nextCursor":""}`)}, nil
+		}
+		return ssh.Result{Stdout: []byte(`{"version":1,"status":{}}`)}, nil
+	}
+	if err := r.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll() with Jinushi failure: %v", err)
+	}
+	environment := r.Snapshot().Environments[0]
+	if environment.Connectivity != health.ConnectivityConnected || environment.Jinushi != "unavailable" || environment.Error != "jinushi-unavailable" {
+		t.Fatalf("connected Jinushi failure state = %#v", environment)
+	}
+	failed = false
+	if err := r.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll() after Jinushi recovery: %v", err)
+	}
+	environment = r.Snapshot().Environments[0]
+	if environment.Connectivity != health.ConnectivityConnected || environment.Jinushi != "ready" || environment.Error != "" {
+		t.Fatalf("recovered state retained an error: %#v", environment)
 	}
 }
 

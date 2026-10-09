@@ -76,6 +76,7 @@ func (r *Runtime) Connect(ctx context.Context, id, host string, bootstrap []stri
 	var cancelAfterPublish context.CancelFunc
 	if !r.closed && r.bindings[id].environment.SSHHost == host {
 		r.jinushi[id] = "ready"
+		delete(r.jinushiErrors, id)
 		cancelAfterPublish = r.invalidatePollLocked()
 	}
 	r.mu.Unlock()

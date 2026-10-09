@@ -77,6 +77,42 @@ func failureWithMessage(w http.ResponseWriter, status int, code, message string)
 		Message string `json:"message"`
 	}{code, message}})
 }
+
+func safeDiagnostic(value string) string {
+	if value == "" {
+		return ""
+	}
+	return runtime.SafeDiagnosticCode(value, "remote-failure")
+}
+
+func cloneSlice[T any](values []T) []T {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]T, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func projectState(state runtime.State) runtime.State {
+	state.Environments = cloneSlice(state.Environments)
+	for i := range state.Environments {
+		environment := &state.Environments[i]
+		environment.Error = safeDiagnostic(environment.Error)
+		environment.Services = cloneSlice(environment.Services)
+		for j := range environment.Services {
+			service := &environment.Services[j]
+			service.ProcessError = safeDiagnostic(service.ProcessError)
+			service.ReadinessError = safeDiagnostic(service.ReadinessError)
+			service.Endpoints = cloneSlice(service.Endpoints)
+			for k := range service.Endpoints {
+				service.Endpoints[k].Failure = safeDiagnostic(service.Endpoints[k].Failure)
+			}
+		}
+	}
+	return state
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && isMutationPath(r.URL.Path) && !h.admitMutation(w, r) {
 		return
@@ -106,7 +142,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			operationFailure(w, err)
 			return
 		}
-		write(w, 200, h.runtime.Snapshot())
+		write(w, 200, projectState(h.runtime.Snapshot()))
 		return
 	}
 	if r.URL.Path == "/v1/service/add" && r.Method == http.MethodPost {
@@ -147,7 +183,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			operationFailure(w, err)
 			return
 		}
-		write(w, 200, h.runtime.Snapshot())
+		write(w, 200, projectState(h.runtime.Snapshot()))
 		return
 	}
 	if r.URL.Path == "/v1/environment/ensure-jinushi" && r.Method == http.MethodPost {
@@ -171,7 +207,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := owner.EnsureJinushi(r.Context(), input.EnvironmentID); err != nil {
 			var f *runtime.Failure
 			if errors.As(err, &f) {
-				failure(w, 502, f.Code)
+				code := runtime.SafeDiagnosticCode(f.Code, "remote-failure")
+				message := runtime.SafeFailureEvidence(code, f.Evidence)
+				if message == "" {
+					message = code
+				}
+				failureWithMessage(w, 502, code, message)
 			} else {
 				failure(w, 502, "remote-failure")
 			}
@@ -210,11 +251,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		write(w, 200, h.runtime.Snapshot())
+		write(w, 200, projectState(h.runtime.Snapshot()))
 		return
 	}
 	if r.URL.Path == "/v1/state" && r.Method == http.MethodGet {
-		write(w, 200, h.runtime.Snapshot())
+		write(w, 200, projectState(h.runtime.Snapshot()))
 		return
 	}
 	if r.Method != http.MethodPost || (r.URL.Path != "/v1/service/start" && r.URL.Path != "/v1/service/stop" && r.URL.Path != "/v1/service/restart" && r.URL.Path != "/v1/endpoint/ensure") {
@@ -250,7 +291,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status := 502
 		var f *runtime.Failure
 		if errors.As(err, &f) {
-			code = f.Code
+			code = runtime.SafeDiagnosticCode(f.Code, "remote-failure")
 		}
 		switch code {
 		case "unknown-identity":
@@ -262,9 +303,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "ssh-timeout", "jinushi-timeout":
 			status = 504
 		}
-		message := code
-		if errors.As(err, &f) && f.Evidence != "" {
-			message = f.Evidence
+		evidence := ""
+		if f != nil {
+			evidence = f.Evidence
+		}
+		message := runtime.SafeFailureEvidence(code, evidence)
+		if message == "" {
+			message = code
 		}
 		failureWithMessage(w, status, code, message)
 		return
@@ -366,18 +411,19 @@ func decodeRequest(r *http.Request, dst any) bool {
 func operationFailure(w http.ResponseWriter, err error) {
 	var f *runtime.Failure
 	if errors.As(err, &f) {
+		code := runtime.SafeDiagnosticCode(f.Code, "remote-failure")
 		status := 502
-		if f.Code == "invalid-request" {
+		if code == "invalid-request" {
 			status = 400
 		}
-		if f.Code == "lifecycle-conflict" {
+		if code == "lifecycle-conflict" {
 			status = 409
 		}
-		message := f.Code
-		if f.Evidence != "" {
-			message = f.Evidence
+		message := runtime.SafeFailureEvidence(code, f.Evidence)
+		if message == "" {
+			message = code
 		}
-		failureWithMessage(w, status, f.Code, message)
+		failureWithMessage(w, status, code, message)
 		return
 	}
 	failure(w, 500, "registration-failed")

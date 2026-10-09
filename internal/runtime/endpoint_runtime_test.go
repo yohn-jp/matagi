@@ -306,8 +306,52 @@ func TestStaticForwardReadinessDoesNotClaimUnavailableApplication(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Ensure(): %v", err)
 	}
-	if ensured.TunnelState != tunnel.StateReady || ensured.EndpointState != health.EndpointUnavailable || !strings.Contains(ensured.Failure, "application endpoint is not responding") {
+	if ensured.TunnelState != tunnel.StateReady || ensured.EndpointState != health.EndpointUnavailable || ensured.Failure != "endpoint-application-unavailable" {
 		t.Fatalf("forward-ready endpoint = %#v; application must remain unavailable", ensured)
+	}
+}
+
+func TestPollProjectsUnhealthyReadinessWithoutChangingProcessOrEndpointAxes(t *testing.T) {
+	launcher := &trackingLauncher{}
+	endpoints := []registry.Endpoint{
+		{ID: "health", Label: "Health", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: 9090},
+		{ID: "ui", Label: "UI", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: 33031},
+	}
+	runtime, _ := newDynamicRuntime(t, &dynamicEvidence{}, launcher, endpoints, "health")
+	defer runtime.Close(context.Background())
+	runtime.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		if request.URL.Path == "/ready" {
+			status = http.StatusServiceUnavailable
+		}
+		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: request}, nil
+	})
+	if _, err := runtime.Ensure(context.Background(), "env", "svc", "ui"); err != nil {
+		t.Fatalf("Ensure(ui): %v", err)
+	}
+	if err := runtime.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll(): %v", err)
+	}
+	service := runtime.Snapshot().Environments[0].Services[0]
+	if service.Process != health.ProcessRunning || service.Readiness != health.ReadinessUnhealthy || service.ReadinessError != "readiness-check-failed" {
+		t.Fatalf("process/readiness projection = %#v; want running process plus safe readiness failure", service)
+	}
+	if len(service.Endpoints) != 2 || service.Endpoints[1].EndpointState != health.EndpointAvailable || service.Endpoints[1].Failure != "" {
+		t.Fatalf("readiness failure changed independent endpoint state: %#v", service.Endpoints)
+	}
+}
+
+func TestStoppedProcessSuppressesDerivedReadinessErrorButKeepsExplicitError(t *testing.T) {
+	runtime, _ := newDynamicRuntime(t, &dynamicEvidence{}, noLauncher{}, []registry.Endpoint{{ID: "health", Label: "Health", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: 9090}}, "health")
+	defer runtime.Close(context.Background())
+	service := runtime.services[key("env", "svc")]
+	view := runtime.serviceView(service, health.ServiceObservation{Process: health.ProcessStopped, Readiness: health.ReadinessNotReady})
+	if view.ReadinessError != "" {
+		t.Fatalf("stopped process acquired derived readiness error %q", view.ReadinessError)
+	}
+	view = runtime.serviceView(service, health.ServiceObservation{Process: health.ProcessStopped, Readiness: health.ReadinessError, ReadinessError: "jinushi-protocol-failed"})
+	if view.ReadinessError != "jinushi-protocol-failed" {
+		t.Fatalf("explicit readiness error was suppressed for stopped process: %q", view.ReadinessError)
 	}
 }
 
@@ -351,7 +395,7 @@ func TestPollRevalidatesOwnedDynamicNonHealthEndpoint(t *testing.T) {
 			ui = endpoint
 		}
 	}
-	if ui.EndpointState != health.EndpointError || ui.TunnelState != tunnel.StateStopped || !strings.Contains(ui.Failure, "evidence is missing") {
+	if ui.EndpointState != health.EndpointError || ui.TunnelState != tunnel.StateStopped || ui.Failure != "endpoint-evidence-missing" {
 		t.Fatalf("dynamic endpoint projection after evidence loss = %#v", ui)
 	}
 }

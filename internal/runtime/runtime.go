@@ -31,6 +31,107 @@ type Failure struct {
 }
 
 func (e *Failure) Error() string { return e.Code }
+
+const partialPersistenceEvidence = "desired service state could not be saved after the Jinushi operation succeeded"
+
+// SafeDiagnosticCode preserves only stable Matagi classifications and known
+// fixed endpoint messages. Unknown provider or remote text falls back to the
+// caller's stable generic code.
+func SafeDiagnosticCode(value, fallback string) string {
+	switch value {
+	case endpointEvidenceMissing:
+		return "endpoint-evidence-missing"
+	case endpointEvidenceInvalid:
+		return "endpoint-evidence-invalid"
+	case endpointEvidenceAmbiguous:
+		return "endpoint-evidence-ambiguous"
+	case endpointEvidenceStale:
+		return "endpoint-evidence-stale"
+	case endpointOutputIncomplete:
+		return "endpoint-output-incomplete"
+	case endpointApplicationDown:
+		return "endpoint-application-unavailable"
+	case "The SSH tunnel to the registered endpoint could not be established.":
+		return "tunnel-unavailable"
+	case "observation failed":
+		return "remote-failure"
+	}
+	if isSafeDiagnosticCode(value) {
+		return value
+	}
+	if isSafeDiagnosticCode(fallback) {
+		return fallback
+	}
+	return ""
+}
+
+func isSafeDiagnosticCode(value string) bool {
+	switch value {
+	case "invalid-request", "unknown-identity", "not-found", "lifecycle-conflict", "registration-unavailable", "registration-failed", "caller-not-authorized", "unsafe-request-origin", "unsupported-media-type", "operation-canceled",
+		"ssh-transport-failed", "host-unreachable", "ssh-timeout", "ssh-connectivity-failed", "ssh-client-failed", "jinushi-unavailable", "jinushi-bootstrap-failed", "jinushi-timeout", "jinushi-readiness-timeout", "jinushi-command-failed", "jinushi-readiness-failed", "jinushi-protocol-failed", "jinushi-state-uncertain", "remote-failure",
+		"tunnel-unavailable", "endpoint-unavailable", "endpoint-evidence-missing", "endpoint-evidence-invalid", "endpoint-evidence-ambiguous", "endpoint-evidence-stale", "endpoint-output-incomplete", "endpoint-application-unavailable", "readiness-check-failed":
+		return true
+	default:
+		return false
+	}
+}
+
+// SafeFailureEvidence permits only fixed recovery evidence and known Jinushi
+// provider codes. It never forwards arbitrary error text.
+func SafeFailureEvidence(code, evidence string) string {
+	if code == "lifecycle-conflict" && evidence == partialPersistenceEvidence {
+		return evidence
+	}
+	switch code {
+	case "jinushi-command-failed", "jinushi-protocol-failed", "jinushi-bootstrap-failed":
+		switch evidence {
+		case "invalid-run", "remote-exit", "stale-run-generation", "supervisor-unavailable":
+			return evidence
+		}
+	}
+	return ""
+}
+
+func safeProbeError(err error, fallback string) error {
+	if err == nil {
+		return nil
+	}
+	var failure *Failure
+	if errors.As(err, &failure) {
+		return errors.New(SafeDiagnosticCode(failure.Code, fallback))
+	}
+	var providerFailure *jinushi.Failure
+	if errors.As(err, &providerFailure) {
+		classified := classify(providerFailure).(*Failure)
+		return errors.New(SafeDiagnosticCode(classified.Code, fallback))
+	}
+	var sshFailure *ssh.Error
+	if errors.As(err, &sshFailure) {
+		return errors.New(SafeDiagnosticCode(classifySSHFailure(sshFailure.Kind), fallback))
+	}
+	return errors.New(SafeDiagnosticCode(err.Error(), fallback))
+}
+
+func classifiedFailureCode(err error, fallback string) string {
+	if err == nil {
+		return ""
+	}
+	var failure *Failure
+	if errors.As(err, &failure) {
+		return SafeDiagnosticCode(failure.Code, fallback)
+	}
+	var providerFailure *jinushi.Failure
+	if errors.As(err, &providerFailure) {
+		classified := classify(providerFailure).(*Failure)
+		return SafeDiagnosticCode(classified.Code, fallback)
+	}
+	var sshFailure *ssh.Error
+	if errors.As(err, &sshFailure) {
+		return SafeDiagnosticCode(classifySSHFailure(sshFailure.Kind), fallback)
+	}
+	return SafeDiagnosticCode(err.Error(), fallback)
+}
+
 func classify(err error) error {
 	if err == nil {
 		return nil
@@ -38,7 +139,9 @@ func classify(err error) error {
 	var f *jinushi.Failure
 	if errors.As(err, &f) {
 		switch f.Kind {
-		case jinushi.KindBootstrapFailed, jinushi.KindBootstrapNotConfigured, jinushi.KindSupervisorUnavailable:
+		case jinushi.KindBootstrapFailed:
+			return &Failure{Code: "jinushi-bootstrap-failed", Evidence: SafeFailureEvidence("jinushi-bootstrap-failed", f.Code)}
+		case jinushi.KindBootstrapNotConfigured, jinushi.KindSupervisorUnavailable:
 			return &Failure{Code: "jinushi-unavailable"}
 		case jinushi.KindTimeout:
 			return &Failure{Code: classifyJinushiTimeout(f)}
@@ -51,9 +154,9 @@ func classify(err error) error {
 		case jinushi.KindInvalid:
 			return &Failure{Code: "invalid-request"}
 		case jinushi.KindCommand:
-			return &Failure{Code: "jinushi-command-failed", Evidence: boundedJinushiCode(f.Code)}
+			return &Failure{Code: "jinushi-command-failed", Evidence: SafeFailureEvidence("jinushi-command-failed", f.Code)}
 		case jinushi.KindProtocol:
-			return &Failure{Code: "jinushi-protocol-failed", Evidence: boundedJinushiCode(f.Code)}
+			return &Failure{Code: "jinushi-protocol-failed", Evidence: SafeFailureEvidence("jinushi-protocol-failed", f.Code)}
 		}
 	}
 	var transport *ssh.Error
@@ -148,6 +251,7 @@ type Runtime struct {
 	observer         *health.Observer
 	pending          map[string]pendingSubmission
 	jinushi          map[string]string
+	jinushiErrors    map[string]string
 	endpointFailures map[tunnel.Identity]string
 	closed           bool
 	httpClient       *http.Client
@@ -389,6 +493,7 @@ func (r *Runtime) configure(snapshot *registry.Snapshot) error {
 	if r.endpointFailures == nil {
 		r.endpointFailures = map[tunnel.Identity]string{}
 	}
+	r.jinushiErrors = map[string]string{}
 	inputs := probeInputs{
 		ssh:              client,
 		bindings:         cloneBindings(bindings),
@@ -405,6 +510,7 @@ func (r *Runtime) configure(snapshot *registry.Snapshot) error {
 	r.bindings = bindings
 	r.services = services
 	r.jinushi = map[string]string{}
+	r.jinushiErrors = map[string]string{}
 	r.observer = observer
 	r.configVersion++
 	if cancelPoll := r.invalidatePollLocked(); cancelPoll != nil {
@@ -579,8 +685,10 @@ func (r *Runtime) EnsureJinushi(ctx context.Context, env string) error {
 		if _, stillRegistered := r.bindings[env]; stillRegistered {
 			if err != nil {
 				r.jinushi[env] = "unavailable"
+				r.jinushiErrors[env] = classifiedFailureCode(err, "jinushi-unavailable")
 			} else {
 				r.jinushi[env] = "ready"
+				delete(r.jinushiErrors, env)
 			}
 			cancelAfterPublish = r.invalidatePollLocked()
 		}
@@ -790,6 +898,7 @@ func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, 
 	r.registry = candidate
 	r.services[pendingKey] = s
 	r.jinushi[env] = "ready"
+	delete(r.jinushiErrors, env)
 	cancelAfterPublish := r.invalidatePollLocked()
 	r.mu.Unlock()
 	if cancelAfterPublish != nil {
@@ -856,7 +965,7 @@ func (r *Runtime) actionObservation(ctx context.Context, s registry.Service, act
 		var err error
 		observation.Process, err = processState(*run)
 		if err != nil {
-			observation.ProcessError = err.Error()
+			observation.ProcessError = safeProbeError(err, "jinushi-state-uncertain").Error()
 		}
 	}
 	if action != "stop" {
@@ -1049,7 +1158,10 @@ func (r *Runtime) connectivityWith(ctx context.Context, inputs probeInputs, env 
 	if errors.As(err, &transportErr) && transportErr.Kind == ssh.FailureTransport {
 		return health.ConnectivityUnreachable, nil
 	}
-	return health.ConnectivityError, err
+	if errors.As(err, &transportErr) && transportErr.Kind == ssh.FailureRemoteCommand {
+		return health.ConnectivityError, errors.New("ssh-connectivity-failed")
+	}
+	return health.ConnectivityError, safeProbeError(err, "ssh-connectivity-failed")
 }
 func (r *Runtime) connectivity(ctx context.Context, env string) (health.ConnectivityState, error) {
 	r.mu.Lock()
@@ -1065,12 +1177,16 @@ func (r *Runtime) processWith(ctx context.Context, inputs probeInputs, env, id s
 	}
 	status, err := b.observe.Status(ctx, s.CorrelationOwner())
 	if err != nil {
-		return health.ProcessUnknown, err
+		return health.ProcessUnknown, safeProbeError(err, "remote-failure")
 	}
 	if status.Run == nil {
 		return health.ProcessUnknown, nil
 	}
-	return processState(*status.Run)
+	state, err := processState(*status.Run)
+	if err != nil {
+		return state, safeProbeError(err, "jinushi-state-uncertain")
+	}
+	return state, nil
 }
 func (r *Runtime) process(ctx context.Context, env, id string) (health.ProcessState, error) {
 	r.mu.Lock()
@@ -1098,7 +1214,7 @@ func (r *Runtime) readinessWith(ctx context.Context, inputs probeInputs, env, id
 	}
 	identity := tunnel.Identity{Environment: env, Service: id, Endpoint: string(s.Health.EndpointID)}
 	if failure := inputs.endpointFailures[identity]; strings.HasPrefix(failure, "Dynamic endpoint") {
-		return health.ReadinessError, errors.New(failure)
+		return health.ReadinessError, safeProbeError(errors.New(failure), "readiness-check-failed")
 	}
 	snap, err := inputs.tunnels.Get(identity)
 	if err != nil {
@@ -1112,14 +1228,14 @@ func (r *Runtime) readinessWith(ctx context.Context, inputs probeInputs, env, id
 	}
 	u, err := url.Parse(snap.LocalURL)
 	if err != nil {
-		return health.ReadinessError, err
+		return health.ReadinessError, safeProbeError(err, "readiness-check-failed")
 	}
 	u.Path = s.Health.Path
 	probeCtx, cancel := context.WithTimeout(ctx, time.Duration(*s.Health.TimeoutMS)*time.Millisecond)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return health.ReadinessError, err
+		return health.ReadinessError, safeProbeError(err, "readiness-check-failed")
 	}
 	resp, err := inputs.httpClient.Do(req)
 	if err != nil {
@@ -1142,7 +1258,7 @@ func (r *Runtime) readiness(ctx context.Context, env, id string) (health.Readine
 func (r *Runtime) endpointStateWith(ctx context.Context, inputs probeInputs, env, id, ep string) (health.EndpointState, error) {
 	identity := tunnel.Identity{Environment: env, Service: id, Endpoint: ep}
 	if failure := inputs.endpointFailures[identity]; failure != "" {
-		return health.EndpointError, errors.New(failure)
+		return health.EndpointError, errors.New(SafeDiagnosticCode(failure, "remote-failure"))
 	}
 	snap, err := inputs.tunnels.Get(identity)
 	if err != nil {
@@ -1151,11 +1267,11 @@ func (r *Runtime) endpointStateWith(ctx context.Context, inputs probeInputs, env
 	switch snap.State {
 	case tunnel.StateReady:
 		if err := probeApplicationEndpoint(ctx, inputs.httpClient, snap.LocalURL); err != nil {
-			return health.EndpointUnavailable, err
+			return health.EndpointUnavailable, safeProbeError(err, "endpoint-application-unavailable")
 		}
 		return health.EndpointAvailable, nil
 	case tunnel.StateFailed:
-		return health.EndpointError, errors.New("The SSH tunnel to the registered endpoint could not be established.")
+		return health.EndpointError, errors.New("tunnel-unavailable")
 	case tunnel.StateStopped:
 		return health.EndpointUnavailable, nil
 	default:
@@ -1267,6 +1383,7 @@ func (r *Runtime) Poll(ctx context.Context) error {
 		return internalCancellation(err)
 	}
 	statuses := make(map[string]string)
+	failureCodes := make(map[string]string)
 	for _, environment := range candidate.Snapshot().Environments {
 		if environment.State != health.ConnectivityConnected {
 			statuses[environment.ID] = "unknown"
@@ -1285,6 +1402,7 @@ func (r *Runtime) Poll(ctx context.Context) error {
 		release()
 		if readyErr != nil {
 			statuses[environment.ID] = "unavailable"
+			failureCodes[environment.ID] = classifiedFailureCode(readyErr, "jinushi-unavailable")
 		} else {
 			statuses[environment.ID] = "ready"
 		}
@@ -1307,6 +1425,7 @@ func (r *Runtime) Poll(ctx context.Context) error {
 	}
 	r.observer = candidate
 	r.jinushi = statuses
+	r.jinushiErrors = failureCodes
 	r.endpointFailures = inputs.endpointFailures
 	r.mu.Unlock()
 	return nil
@@ -1385,14 +1504,14 @@ type Endpoint struct {
 }
 
 func observationError(message string) string {
-	if message != "" {
-		return "observation failed"
+	if message == "" {
+		return ""
 	}
-	return ""
+	return SafeDiagnosticCode(message, "remote-failure")
 }
 func tunnelFailure(s tunnel.Snapshot) string {
 	if s.State == tunnel.StateFailed {
-		return "tunnel unavailable"
+		return "tunnel-unavailable"
 	}
 	return ""
 }
@@ -1415,7 +1534,10 @@ func (r *Runtime) endpointView(s registry.Service, ep registry.Endpoint, obs hea
 	if failure == "" {
 		failure = tunnelFailure(snap)
 	}
-	return Endpoint{ID: string(ep.ID), Label: ep.Label, EndpointState: state, TunnelState: t, LocalURL: snap.LocalURL, Failure: bounded(failure)}
+	if failure != "" {
+		failure = SafeDiagnosticCode(failure, "remote-failure")
+	}
+	return Endpoint{ID: string(ep.ID), Label: ep.Label, EndpointState: state, TunnelState: t, LocalURL: snap.LocalURL, Failure: failure}
 }
 func (r *Runtime) serviceView(s registry.Service, obs health.ServiceObservation) Service {
 	result := Service{ID: string(s.ID), DesiredState: s.DesiredState, State: obs.State, Process: obs.Process, Readiness: obs.Readiness, ProcessError: observationError(obs.ProcessError), ReadinessError: observationError(obs.ReadinessError), Endpoints: []Endpoint{}}
@@ -1427,6 +1549,9 @@ func (r *Runtime) serviceView(s registry.Service, obs health.ServiceObservation)
 	}
 	if result.Readiness == "" {
 		result.Readiness = health.ReadinessUnknown
+	}
+	if result.ReadinessError == "" && result.Process != health.ProcessStopped && (result.Readiness == health.ReadinessNotReady || result.Readiness == health.ReadinessUnhealthy) {
+		result.ReadinessError = "readiness-check-failed"
 	}
 	for _, ep := range s.Endpoints {
 		var observation health.EndpointObservation
@@ -1449,6 +1574,10 @@ func (r *Runtime) Snapshot() State {
 	for id, status := range r.jinushi {
 		jinushi[id] = status
 	}
+	jinushiErrors := make(map[string]string, len(r.jinushiErrors))
+	for id, code := range r.jinushiErrors {
+		jinushiErrors[id] = code
+	}
 	r.mu.Unlock()
 	observed := observer.Snapshot()
 	result := State{Version: 1, Environments: []Environment{}}
@@ -1466,6 +1595,12 @@ func (r *Runtime) Snapshot() State {
 				}
 				break
 			}
+		}
+		if view.Error == "" && view.Connectivity == health.ConnectivityUnreachable {
+			view.Error = "host-unreachable"
+		}
+		if view.Error == "" {
+			view.Error = SafeDiagnosticCode(jinushiErrors[view.ID], "")
 		}
 		if len(view.Services) == 0 {
 			for _, s := range registrySnapshot.Services() {
