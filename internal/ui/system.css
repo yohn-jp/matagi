@@ -9,15 +9,15 @@
 
 /* ---- color roles (dark is the default; light follows the OS) ----------- */
 :root {
-  --bg: #131519; --chrome: #0f1114; --surface: #181b20; --raised: #1f232a; --inset: #101216;
-  --line: #262a31; --line-2: #353b44;
-  --text: #e6e8eb; --text-2: #a4abb5; --text-3: #8a929d;
-  --accent: #6da6f7; --accent-ink: #0a1628; --accent-soft: rgba(109, 166, 247, .14);
-  --ok: #45bf8b; --ok-soft: rgba(69, 191, 139, .13);
-  --warn: #e3a63c; --warn-soft: rgba(227, 166, 60, .14);
-  --bad: #ef6a6a; --bad-soft: rgba(239, 106, 106, .13);
-  --idle: #8b939e; --idle-soft: rgba(139, 147, 158, .13);
-  --track: #262b33;
+  --bg: #111713; --chrome: #0d120f; --surface: #19221d; --raised: #26312b; --inset: #141b16;
+  --line: #36463c; --line-2: #718574;
+  --text: #e5ece6; --text-2: #b0bdb3; --text-3: #92a397;
+  --accent: #98c5a7; --accent-ink: #102016; --accent-soft: rgba(152, 197, 167, .14);
+  --ok: #8bd3a5; --ok-soft: rgba(139, 211, 165, .14);
+  --warn: #f0c66c; --warn-soft: rgba(240, 198, 108, .14);
+  --bad: #ff9288; --bad-soft: rgba(255, 146, 136, .14);
+  --idle: #b0bdb3; --idle-soft: rgba(176, 189, 179, .12);
+  --track: #2a352e;
 
   /* typography roles */
   --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
@@ -50,15 +50,15 @@
 }
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f4f5f7; --chrome: #ebedf0; --surface: #ffffff; --raised: #f3f4f6; --inset: #ffffff;
-    --line: #e0e3e8; --line-2: #c9ced6;
-    --text: #15181c; --text-2: #4d5560; --text-3: #626a75;
-    --accent: #1f5fbf; --accent-ink: #ffffff; --accent-soft: rgba(31, 95, 191, .1);
-    --ok: #126f46; --ok-soft: rgba(23, 128, 79, .1);
-    --warn: #8f5b00; --warn-soft: rgba(190, 125, 0, .12);
-    --bad: #c42b2b; --bad-soft: rgba(196, 43, 43, .08);
-    --idle: #646d78; --idle-soft: rgba(100, 109, 120, .1);
-    --track: #e3e6ea;
+    --bg: #f1f4ef; --chrome: #e4ebe2; --surface: #ffffff; --raised: #e4ebe2; --inset: #ffffff;
+    --line: #b6c5b8; --line-2: #738678;
+    --text: #18291e; --text-2: #425848; --text-3: #526658;
+    --accent: #285d3e; --accent-ink: #ffffff; --accent-soft: rgba(40, 93, 62, .12);
+    --ok: #17683e; --ok-soft: rgba(23, 104, 62, .1);
+    --warn: #81550b; --warn-soft: rgba(129, 85, 11, .12);
+    --bad: #a12723; --bad-soft: rgba(161, 39, 35, .08);
+    --idle: #526658; --idle-soft: rgba(82, 102, 88, .08);
+    --track: #e4ebe2;
     --shadow-pop: 0 8px 24px rgba(21, 24, 28, .16);
   }
 }
