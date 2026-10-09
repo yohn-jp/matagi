@@ -194,7 +194,8 @@ func executeMoveTestScript(t *testing.T, ctx context.Context, host *nativeViewsH
 			return
 		}
 		value := windows.UTF16PtrToString((*uint16)(pointer))
-		windows.CoTaskMemFree(pointer)
+		// ExecuteScript passes an input LPCWSTR borrowed for this callback;
+		// unlike a WebView2 out-parameter it must not be CoTaskMemFree'd.
 		result <- value
 	})
 	err = host.invoke(ctx, false, func() error {
