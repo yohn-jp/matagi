@@ -16,7 +16,6 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/wailsapp/go-webview2/pkg/webview2"
 	"github.com/wailsapp/go-webview2/webviewloader"
 	"golang.org/x/sys/windows"
 )
@@ -107,14 +106,14 @@ type nativeView struct {
 	closedCh              chan struct{}
 
 	// The following fields are read or changed only on the owning STA.
-	environment           *webview2.ICoreWebView2Environment
-	controller            *webview2.ICoreWebView2Controller
-	webview               *webview2.ICoreWebView2
+	environment           *viewsEnvironment
+	controller            *viewsController
+	webview               *viewsCoreWebView2
 	guard                 *navigationGuard
 	environmentHandler    *viewsEnvironmentHandler
 	controllerHandler     *viewsControllerHandler
-	processFailedHandler  *viewsProcessFailedHandler
-	processFailedToken    webview2.EventRegistrationToken
+	processFailedHandler  *eventHandler
+	processFailedToken    int64
 	processFailedAttached bool
 	parentWindow          uintptr
 	controllerClosed      bool
@@ -152,77 +151,6 @@ type viewsEnvironmentHandler struct {
 
 func (h *viewsEnvironmentHandler) EnvironmentCompleted(result webviewloader.HRESULT, created *webviewloader.ICoreWebView2Environment) webviewloader.HRESULT {
 	return h.host.environmentCompleted(h.view, result, created)
-}
-
-type viewsControllerHandler struct {
-	host  *nativeViewsHost
-	view  *nativeView
-	iface *webview2.ICoreWebView2CreateCoreWebView2ControllerCompletedHandler
-}
-
-func newViewsControllerHandler(host *nativeViewsHost, view *nativeView) *viewsControllerHandler {
-	handler := &viewsControllerHandler{host: host, view: view}
-	handler.iface = webview2.NewICoreWebView2CreateCoreWebView2ControllerCompletedHandler(handler)
-	return handler
-}
-
-func (h *viewsControllerHandler) QueryInterface(refiid, object uintptr) uintptr {
-	if refiid == 0 || object == 0 {
-		return uintptr(ePointer)
-	}
-	want := *(*windows.GUID)(unsafe.Pointer(refiid))
-	if want != iidIUnknown && want != iidViewsControllerCompletedEH {
-		*(*uintptr)(unsafe.Pointer(object)) = 0
-		return uintptr(eNoInterface)
-	}
-	*(*uintptr)(unsafe.Pointer(object)) = uintptr(unsafe.Pointer(h.iface))
-	return uintptr(sOK)
-}
-
-func (*viewsControllerHandler) AddRef() uintptr  { return 1 }
-func (*viewsControllerHandler) Release() uintptr { return 1 }
-
-func (h *viewsControllerHandler) CreateCoreWebView2ControllerCompleted(result uintptr, controller *webview2.ICoreWebView2Controller) uintptr {
-	return h.host.controllerCompleted(h.view, result, controller)
-}
-
-type viewsProcessFailedHandler struct {
-	host  *nativeViewsHost
-	view  *nativeView
-	iface *webview2.ICoreWebView2ProcessFailedEventHandler
-}
-
-func newViewsProcessFailedHandler(host *nativeViewsHost, view *nativeView) *viewsProcessFailedHandler {
-	handler := &viewsProcessFailedHandler{host: host, view: view}
-	handler.iface = webview2.NewICoreWebView2ProcessFailedEventHandler(handler)
-	return handler
-}
-
-func (h *viewsProcessFailedHandler) QueryInterface(refiid, object uintptr) uintptr {
-	if refiid == 0 || object == 0 {
-		return uintptr(ePointer)
-	}
-	want := *(*windows.GUID)(unsafe.Pointer(refiid))
-	if want != iidIUnknown && want != iidViewsProcessFailedEH {
-		*(*uintptr)(unsafe.Pointer(object)) = 0
-		return uintptr(eNoInterface)
-	}
-	*(*uintptr)(unsafe.Pointer(object)) = uintptr(unsafe.Pointer(h.iface))
-	return uintptr(sOK)
-}
-
-func (*viewsProcessFailedHandler) AddRef() uintptr  { return 1 }
-func (*viewsProcessFailedHandler) Release() uintptr { return 1 }
-
-func (h *viewsProcessFailedHandler) ProcessFailed(_ *webview2.ICoreWebView2, args *webview2.ICoreWebView2ProcessFailedEventArgs) uintptr {
-	message := "WebView2 process failed"
-	if args != nil {
-		if kind, err := args.GetProcessFailedKind(); err == nil {
-			message = fmt.Sprintf("WebView2 process failed (kind %d)", kind)
-		}
-	}
-	h.host.queueProcessFailure(h.view, errors.New(message))
-	return uintptr(windows.S_OK)
 }
 
 func prepareViewProfile(config ViewConfig) (ViewConfig, string, error) {
@@ -599,7 +527,7 @@ func (h *nativeViewsHost) windowProc(hwnd uintptr, owner viewWindowOwner, messag
 		selected := h.views[h.selected]
 		h.mu.Unlock()
 		if selected != nil && selected.ready && selected.controller != nil {
-			_ = selected.controller.MoveFocus(webview2.COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)
+			_ = selected.controller.MoveFocus(0)
 		}
 		return 0
 	}
@@ -944,12 +872,12 @@ func (h *nativeViewsHost) environmentCompleted(v *nativeView, result webviewload
 		return webviewloader.HRESULT(windows.S_OK)
 	}
 
-	env := (*webview2.ICoreWebView2Environment)(unsafe.Pointer(created))
+	env := &viewsEnvironment{pointer: unsafe.Pointer(created)}
 	env.AddRef()
 	v.environment = env
 	parent := h.root
 	if parent == 0 {
-		_ = releaseWebView2Object(unsafe.Pointer(env))
+		_ = releaseWebView2Object(env.pointer)
 		v.environment = nil
 		h.finishViewClose(v, errors.New("WebView2 host window was destroyed during creation"))
 		return webviewloader.HRESULT(windows.S_OK)
@@ -957,10 +885,11 @@ func (h *nativeViewsHost) environmentCompleted(v *nativeView, result webviewload
 	handler := newViewsControllerHandler(h, v)
 	v.controllerHandler = handler
 	v.pendingController = true
-	if err := env.CreateCoreWebView2Controller(webview2.HWND(parent), handler.iface); err != nil {
+	if err := env.CreateCoreWebView2Controller(parent, handler.ref()); err != nil {
 		v.pendingController = false
 		v.controllerHandler = nil
-		_ = releaseWebView2Object(unsafe.Pointer(env))
+		handler.close()
+		_ = releaseWebView2Object(env.pointer)
 		v.environment = nil
 		if h.isCancelled(v) {
 			h.finishViewClose(v, nil)
@@ -972,15 +901,16 @@ func (h *nativeViewsHost) environmentCompleted(v *nativeView, result webviewload
 	return webviewloader.HRESULT(windows.S_OK)
 }
 
-func (h *nativeViewsHost) controllerCompleted(v *nativeView, result uintptr, controller *webview2.ICoreWebView2Controller) uintptr {
+func (h *nativeViewsHost) controllerCompleted(v *nativeView, result uintptr, controllerPointer unsafe.Pointer) uintptr {
 	v.pendingController = false
 	v.controllerHandler = nil
 	if v.environment != nil {
-		_ = releaseWebView2Object(unsafe.Pointer(v.environment))
+		_ = releaseWebView2Object(v.environment.pointer)
 		v.environment = nil
 	}
-	if controller == nil || int32(result) < 0 {
-		if controller != nil {
+	if controllerPointer == nil || int32(result) < 0 {
+		if controllerPointer != nil {
+			controller := &viewsController{pointer: controllerPointer}
 			controller.AddRef()
 			v.controller = controller
 			h.closeControllerOnSTA(v)
@@ -992,6 +922,7 @@ func (h *nativeViewsHost) controllerCompleted(v *nativeView, result uintptr, con
 		}
 		return uintptr(windows.S_OK)
 	}
+	controller := &viewsController{pointer: controllerPointer}
 	controller.AddRef()
 	v.controller = controller
 	if h.isCancelled(v) {
@@ -1067,11 +998,17 @@ func (h *nativeViewsHost) initializeController(v *nativeView) error {
 	v.guard = newScopedNavigationGuard(v.config.Policy, func(uri string) {
 		fmt.Fprintf(os.Stderr, "Matagi blocked WebView2 navigation to %q\n", uri)
 	}, true)
-	if err := v.guard.attach(unsafe.Pointer(webview)); err != nil {
+	if err := v.guard.attach(webview.pointer); err != nil {
 		return fmt.Errorf("installing WebView2 navigation and permission policy: %w", err)
 	}
-	processFailedHandler := newViewsProcessFailedHandler(h, v)
-	token, err := webview.AddProcessFailed(processFailedHandler.iface)
+	processFailedHandler := newEventHandler(iidViewsProcessFailedEH, func(args unsafe.Pointer) {
+		message := "WebView2 process failed"
+		if kind, err := viewsProcessFailedKind(args); err == nil {
+			message = fmt.Sprintf("WebView2 process failed (kind %d)", kind)
+		}
+		h.queueProcessFailure(v, errors.New(message))
+	})
+	token, err := webview.AddProcessFailed(processFailedHandler)
 	if err != nil {
 		return fmt.Errorf("monitoring WebView2 process failures: %w", err)
 	}
@@ -1216,7 +1153,7 @@ func (h *nativeViewsHost) focusOnSTA(handle ViewHandle) error {
 		return fmt.Errorf("activating Matagi view host window: %w", err)
 	}
 	viewsSetFocus.Call(root)
-	return v.controller.MoveFocus(webview2.COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)
+	return v.controller.MoveFocus(0)
 }
 
 func (h *nativeViewsHost) closeAllOnSTA() {
@@ -1263,7 +1200,7 @@ func (h *nativeViewsHost) closeControllerOnSTA(v *nativeView) {
 	v.controllerClosed = true
 	guard := v.guard
 	if guard != nil && v.webview != nil {
-		if err := guard.detach(unsafe.Pointer(v.webview)); err != nil {
+		if err := guard.detach(v.webview.pointer); err != nil {
 			v.closeErr = errors.Join(v.closeErr, fmt.Errorf("removing WebView2 navigation handlers: %w", err))
 		}
 	}
@@ -1277,12 +1214,12 @@ func (h *nativeViewsHost) closeControllerOnSTA(v *nativeView) {
 		v.closeErr = errors.Join(v.closeErr, fmt.Errorf("closing WebView2 controller: %w", err))
 	}
 	if v.webview != nil {
-		if err := releaseWebView2Object(unsafe.Pointer(v.webview)); err != nil {
+		if err := releaseWebView2Object(v.webview.pointer); err != nil {
 			v.closeErr = errors.Join(v.closeErr, fmt.Errorf("releasing WebView2 surface: %w", err))
 		}
 		v.webview = nil
 	}
-	if err := releaseWebView2Object(unsafe.Pointer(v.controller)); err != nil {
+	if err := releaseWebView2Object(v.controller.pointer); err != nil {
 		v.closeErr = errors.Join(v.closeErr, fmt.Errorf("releasing WebView2 controller: %w", err))
 	}
 	v.controller = nil
@@ -1299,7 +1236,7 @@ func (h *nativeViewsHost) finishViewClose(v *nativeView, err error) {
 		h.closeControllerOnSTA(v)
 	}
 	if v.environment != nil {
-		_ = releaseWebView2Object(unsafe.Pointer(v.environment))
+		_ = releaseWebView2Object(v.environment.pointer)
 		v.environment = nil
 	}
 	h.mu.Lock()
@@ -1328,7 +1265,7 @@ func (h *nativeViewsHost) failView(v *nativeView, err error) {
 		h.closeControllerOnSTA(v)
 	}
 	if v.environment != nil {
-		_ = releaseWebView2Object(unsafe.Pointer(v.environment))
+		_ = releaseWebView2Object(v.environment.pointer)
 		v.environment = nil
 	}
 	h.mu.Lock()
@@ -1472,7 +1409,7 @@ func (h *nativeViewsHost) resizeViews(hwnd uintptr) {
 	}
 	h.mu.Unlock()
 	for _, v := range views {
-		bounds := webview2.RECT{Left: 0, Top: 0, Right: width, Bottom: height}
+		bounds := viewsRECT{Left: 0, Top: 0, Right: width, Bottom: height}
 		if !v.trusted {
 			bounds.Top = scaleForDPI(chromeHeightDIP, dpi)
 			if bounds.Bottom < bounds.Top {
@@ -1495,7 +1432,7 @@ func (h *nativeViewsHost) setBounds(v *nativeView) error {
 		return fmt.Errorf("reading Matagi view host bounds: %w", err)
 	}
 	dpi := viewWindowDPI(h.root)
-	bounds := webview2.RECT{Left: 0, Top: 0, Right: rect.right - rect.left, Bottom: rect.bottom - rect.top}
+	bounds := viewsRECT{Left: 0, Top: 0, Right: rect.right - rect.left, Bottom: rect.bottom - rect.top}
 	if !v.trusted {
 		bounds.Top = scaleForDPI(chromeHeightDIP, dpi)
 		if bounds.Bottom < bounds.Top {
@@ -1521,23 +1458,11 @@ func viewWindowDPI(hwnd uintptr) uint32 {
 	return systemDPI()
 }
 
-func releaseWebView2Object(object unsafe.Pointer) error {
-	if object == nil {
-		return nil
-	}
-	unknown := (*webview2.IUnknown)(object)
-	if unknown.Vtbl == nil {
-		return errors.New("WebView2 COM object has no IUnknown vtable")
-	}
-	unknown.Vtbl.Release.Call(uintptr(object))
-	return nil
-}
-
-func lockDownViewSettings(settings *webview2.ICoreWebView2Settings) error {
+func lockDownViewSettings(settings *viewsSettings) error {
 	if settings == nil {
 		return errors.New("WebView2 settings are unavailable")
 	}
-	defer releaseWebView2Object(unsafe.Pointer(settings))
+	defer releaseWebView2Object(settings.pointer)
 	for _, disable := range []func(bool) error{
 		settings.PutIsWebMessageEnabled,
 		settings.PutAreHostObjectsAllowed,
