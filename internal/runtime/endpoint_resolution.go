@@ -34,18 +34,17 @@ type endpointTarget struct {
 	origin string
 }
 
-func (r *Runtime) resolveEndpoint(ctx context.Context, service registry.Service, endpoint registry.Endpoint) (uint16, error) {
+func resolveEndpoint(ctx context.Context, client remoteRunner, binding binding, service registry.Service, endpoint registry.Endpoint) (uint16, error) {
 	if endpoint.Resolution == nil {
 		return uint16(endpoint.RemotePort), nil
-	}
-	binding, exists := r.bindings[string(service.EnvironmentID)]
-	if !exists {
-		return 0, errors.New(endpointEvidenceMissing)
 	}
 	owner := service.CorrelationOwner()
 	before, err := binding.observe.Status(ctx, owner)
 	if err != nil {
 		return 0, runEvidenceFailure(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	if before.Run == nil || before.Run.State != jinushi.StateRunning {
 		return 0, errors.New(endpointEvidenceMissing)
@@ -55,11 +54,17 @@ func (r *Runtime) resolveEndpoint(ctx context.Context, service registry.Service,
 	if err != nil {
 		return 0, errors.New(endpointOutputIncomplete)
 	}
-	descriptorResult, err := r.ssh.Run(ctx, binding.environment.SSHHost, []string{
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	descriptorResult, err := client.Run(ctx, binding.environment.SSHHost, []string{
 		"head", "-c", strconv.Itoa(maxEndpointDescriptorBytes + 1), "--", endpoint.Resolution.Path,
 	}, commandTimeout)
 	if err != nil || descriptorResult.ExitCode != 0 {
 		return 0, errors.New(endpointEvidenceMissing)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	if len(descriptorResult.Stdout) > maxEndpointDescriptorBytes {
 		return 0, errors.New(endpointEvidenceInvalid)
@@ -82,6 +87,9 @@ func (r *Runtime) resolveEndpoint(ctx context.Context, service registry.Service,
 	after, err := binding.observe.Status(ctx, owner)
 	if err != nil {
 		return 0, runEvidenceFailure(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	if after.Run == nil || after.Run.ID != runID || after.Run.State != jinushi.StateRunning {
 		return 0, errors.New(endpointEvidenceStale)
