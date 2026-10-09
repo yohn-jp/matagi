@@ -222,11 +222,8 @@ func releaseWebView2Object(object unsafe.Pointer) error {
 	if *(*unsafe.Pointer)(object) == nil {
 		return errors.New("WebView2 COM object has no IUnknown vtable")
 	}
-	result := comCall(object, 2)
+	comCall(object, 2)
 	runtime.KeepAlive(object)
-	if result != sOK {
-		return fmt.Errorf("releasing WebView2 COM object failed: HRESULT 0x%08x", uint32(result))
-	}
 	return nil
 }
 
