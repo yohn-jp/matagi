@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/yohn-jp/matagi/internal/i18n"
+	"github.com/yohn-jp/matagi/internal/runtime"
 	"github.com/yohn-jp/matagi/internal/settings"
 )
 
@@ -192,14 +193,14 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request, message string) 
 	}
 	for i := range state.Environments {
 		env := &state.Environments[i]
-		env.Error = bounded(env.Error, maxErrorMessage)
+		env.Error = h.diagnosticHint(env.Error)
 		for j := range env.Services {
 			service := &env.Services[j]
-			service.ProcessError = bounded(service.ProcessError, maxErrorMessage)
-			service.ReadinessError = bounded(service.ReadinessError, maxErrorMessage)
+			service.ProcessError = h.diagnosticHint(service.ProcessError)
+			service.ReadinessError = h.diagnosticHint(service.ReadinessError)
 			for k := range service.Endpoints {
 				endpoint := &service.Endpoints[k]
-				endpoint.Failure = bounded(endpoint.Failure, maxErrorMessage)
+				endpoint.Failure = h.diagnosticHint(endpoint.Failure)
 				endpoint.LocalURL = localAvailabilityURL(endpoint)
 			}
 		}
@@ -250,13 +251,29 @@ func (h *handler) addService(w http.ResponseWriter, r *http.Request) {
 func (h *handler) describeFailure(err error) string {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		if hint := h.errorHint(apiErr.Code); hint != "" {
-			// The hint classifies the authority that failed; the bounded API
-			// envelope remains literal evidence beside it.
-			return hint + " " + bounded(apiErr.Error(), maxErrorMessage-180)
+		code := runtime.SafeDiagnosticCode(apiErr.Code, "remote-failure")
+		switch code {
+		case "registration-failed", "unsafe-request-origin", "caller-not-authorized", "unsupported-media-type":
+			return code + ": " + h.locale().T("The local API rejected this request. Refresh the workspace before retrying.")
 		}
+		hint := h.errorHint(code)
+		if hint == "" {
+			hint = h.errorHint("remote-failure")
+		}
+		if evidence := runtime.SafeFailureEvidence(code, apiErr.Message); evidence != "" {
+			return hint + " " + evidence
+		}
+		return hint
 	}
-	return bounded(err.Error(), maxErrorMessage)
+	return h.errorHint("remote-failure")
+}
+
+func (h *handler) diagnosticHint(value string) string {
+	code := runtime.SafeDiagnosticCode(value, "")
+	if code == "" {
+		return ""
+	}
+	return h.errorHint(code)
 }
 
 func (h *handler) errorHint(code string) string {
@@ -272,16 +289,18 @@ func (h *handler) errorHint(code string) string {
 		message = "SSH connected, but the remote connectivity check failed."
 	case "ssh-client-failed":
 		message = "The local OpenSSH client could not complete the request. Check its installation and configuration."
-	case "jinushi-unavailable":
+	case "jinushi-unavailable", "jinushi-bootstrap-failed":
 		message = "Jinushi is unavailable. Check that it is installed, or specify its bootstrap command under Advanced."
 	case "jinushi-timeout", "jinushi-readiness-timeout":
 		message = "Jinushi did not respond before the request timed out. Check Jinushi on the development host."
-	case "jinushi-command-failed", "jinushi-bootstrap-failed", "jinushi-readiness-failed", "remote-failure":
+	case "jinushi-command-failed", "jinushi-readiness-failed":
 		message = "Jinushi rejected the lifecycle action or returned a failed result. Check its response and the service registration."
 	case "jinushi-protocol-failed":
 		message = "Jinushi returned an invalid response. Check Jinushi on the development host."
 	case "lifecycle-conflict", "registration-unavailable":
 		message = "This environment or service is already registered or changing state. Refresh the workspace."
+	case "registration-failed", "unsafe-request-origin", "caller-not-authorized", "unsupported-media-type":
+		message = "The local API rejected this request. Refresh the workspace before retrying."
 	case "operation-canceled":
 		message = "The operation was canceled."
 	case "unknown-identity", "not-found":
@@ -290,6 +309,12 @@ func (h *handler) errorHint(code string) string {
 		message = "The endpoint could not be ensured. Check Jinushi, service readiness, and the tunnel status."
 	case "endpoint-unavailable":
 		message = "The application endpoint could not be resolved or reached. Check its descriptor, managed Run output, and service status."
+	case "endpoint-evidence-missing", "endpoint-evidence-invalid", "endpoint-evidence-ambiguous", "endpoint-evidence-stale", "endpoint-output-incomplete", "endpoint-application-unavailable":
+		message = "The application endpoint could not be resolved or reached. Check its descriptor, managed Run output, and service status."
+	case "readiness-check-failed":
+		message = "Check the service health endpoint and service logs."
+	case "remote-failure":
+		message = "This failure could not be classified. Refresh the workspace and inspect the service status before retrying."
 	default:
 		return ""
 	}
@@ -300,7 +325,10 @@ func (h *handler) describeActionFailure(err error) string {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.Code == "lifecycle-conflict" {
 		hint := h.locale().T("The lifecycle action could not be confirmed. Refresh the workspace and inspect the managed process before retrying this action.")
-		return hint + " " + bounded(apiErr.Error(), maxErrorMessage-190)
+		if evidence := runtime.SafeFailureEvidence("lifecycle-conflict", apiErr.Message); evidence != "" {
+			return hint + " " + evidence
+		}
+		return hint
 	}
 	return h.describeFailure(err)
 }

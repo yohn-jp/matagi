@@ -33,20 +33,72 @@ func TestHandlerRendersContractStateWithoutUnknownRuntimeData(t *testing.T) {
 	}
 	body := response.Body.String()
 	for _, want := range []string{
-		"dev", "Connection · SSH", "environment error", "Jinushi · process supervisor", "Desired", "Process", "Readiness", "running", "tone-ok", "prefers-color-scheme: light", "aria-busy", "Live · updates every 3 seconds", "setInterval(refresh,3000)", "Start", "Restart", "Stop",
-		"process warning", "readiness warning", "Dashboard", "available", "Tunnel: ready", "Open",
+		"dev", "Connection · SSH", "Jinushi · process supervisor", "Desired", "Process", "Readiness", "running", "tone-ok", "prefers-color-scheme: light", "aria-busy", "Live · updates every 3 seconds", "setInterval(refresh,3000)", "Start", "Restart", "Stop",
+		"Dashboard", "available", "Tunnel: ready", "Open",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page lacks %q", want)
 		}
 	}
-	for _, forbidden := range []string{"run-secret", "credential-secret", "987654", "43123"} {
+	for _, forbidden := range []string{"run-secret", "credential-secret", "987654", "43123", "environment error", "process warning", "readiness warning"} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("page exposes %q", forbidden)
 		}
 	}
 	if response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("security headers = %#v", response.Header())
+	}
+}
+
+func TestHandlerProjectsUntrustedDiagnosticStateToFixedHints(t *testing.T) {
+	const secret = "bearer-secret-abc123"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"version":1,"environments":[{"id":"dev","connectivity":"connected","error":%q,"services":[{"id":"svc","desiredState":"running","state":"unhealthy","process":"running","readiness":"unhealthy","processError":"host-unreachable","readinessError":%q,"endpoints":[{"id":"ui","label":"Dashboard","endpointState":"error","tunnelState":"failed","failure":%q}]}]}]}`, secret, secret, secret)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHandler(t, client, nil)
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, "SSH transport or authentication failed") || strings.Contains(body, secret) {
+		t.Fatalf("projected diagnostic state = %d %s", response.Code, body)
+	}
+}
+
+func TestBootstrapFailureUsesSetupHintWithoutRawCommand(t *testing.T) {
+	const secret = "start-supervisor --token=bearer-secret-abc123"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"version":1,"error":{"code":"jinushi-bootstrap-failed","message":"`+secret+`"}}`, http.StatusBadGateway)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHandler(t, client, nil)
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/jinushi", url.Values{"environmentId": {"dev"}}, h.token))
+	body := response.Body.String()
+	if response.Code != http.StatusBadGateway || !strings.Contains(body, "bootstrap command under Advanced") || strings.Contains(body, secret) || strings.Contains(body, "bearer-secret-abc123") {
+		t.Fatalf("bootstrap failure hint = %d %s", response.Code, body)
+	}
+}
+
+func TestAdmissionFailuresKeepOnlySafeCodeAndFixedLocalAPIHint(t *testing.T) {
+	h := testHandler(t, nil, nil)
+	for _, code := range []string{"registration-failed", "unsafe-request-origin", "caller-not-authorized", "unsupported-media-type"} {
+		message := h.describeFailure(&APIError{Code: code, Message: "bearer-secret-abc123"})
+		if !strings.HasPrefix(message, code+": ") || !strings.Contains(message, "local API rejected") || !strings.Contains(message, "Refresh the workspace") || strings.Contains(message, "bearer-secret-abc123") || strings.Contains(message, "Jinushi") {
+			t.Errorf("admission failure %q hint = %q", code, message)
+		}
+	}
+	unknown := h.describeFailure(&APIError{Code: "credential-secret-abc123", Message: "bearer-secret-abc123"})
+	if !strings.Contains(unknown, "Refresh the workspace") || strings.Contains(unknown, "credential-secret-abc123") || strings.Contains(unknown, "bearer-secret-abc123") || strings.Contains(unknown, "Jinushi") {
+		t.Fatalf("unknown API failure was unsafe or misclassified: %q", unknown)
 	}
 }
 
@@ -374,7 +426,7 @@ func TestLocaleSelectionPersistsAndRendersCompleteJapaneseWorkspace(t *testing.T
 	response = httptest.NewRecorder()
 	h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.String()
-	for _, want := range []string{`<html lang="ja">`, "開発環境", "接続 · SSH", "目標状態", "プロセス", "準備状態", "開始", "Dashboard", "process warning", `name="environmentId"`, `name="serviceId"`} {
+	for _, want := range []string{`<html lang="ja">`, "開発環境", "接続 · SSH", "目標状態", "プロセス", "準備状態", "開始", "Dashboard", `name="environmentId"`, `name="serviceId"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("Japanese workspace lacks %q", want)
 		}
@@ -411,7 +463,7 @@ func TestLocaleReturnPathIsRestrictedAndUnsupportedSelectionIsRejected(t *testin
 	}
 }
 
-func TestLifecycleActionConflictPreservesEvidenceAndDoesNotClaimNoChange(t *testing.T) {
+func TestLifecycleActionConflictHidesUntrustedEvidenceAndDoesNotClaimNoChange(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, `{"version":1,"error":{"code":"lifecycle-conflict","message":"submission-123"}}`, http.StatusConflict)
 	}))
@@ -422,13 +474,32 @@ func TestLifecycleActionConflictPreservesEvidenceAndDoesNotClaimNoChange(t *test
 	response := httptest.NewRecorder()
 	h.ServeHTTP(response, formRequest(http.MethodPost, "/action", form, h.token))
 	body := response.Body.String()
-	for _, want := range []string{"lifecycle-conflict", "submission-123", "could not be confirmed", "inspect the managed process"} {
+	for _, want := range []string{"could not be confirmed", "inspect the managed process"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("action conflict lacks %q: %s", want, body)
 		}
 	}
+	if strings.Contains(body, "submission-123") {
+		t.Fatal("action conflict leaked untrusted submission evidence")
+	}
 	if strings.Contains(body, "No changes were saved.") {
 		t.Fatal("ambiguous lifecycle result was represented as no change")
+	}
+}
+
+func TestLifecycleConflictKeepsFixedPartialPersistenceEvidence(t *testing.T) {
+	const evidence = "desired service state could not be saved after the Jinushi operation succeeded"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"version":1,"error":{"code":"lifecycle-conflict","message":"`+evidence+`"}}`, http.StatusConflict)
+	}))
+	defer server.Close()
+	client, _ := NewClient(server.URL, time.Second)
+	h := testHandler(t, client, nil)
+	form := url.Values{"environmentId": {"dev"}, "serviceId": {"svc"}, "action": {"start"}}
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/action", form, h.token))
+	if !strings.Contains(response.Body.String(), evidence) {
+		t.Fatalf("safe partial-persistence evidence was dropped: %s", response.Body.String())
 	}
 }
 
