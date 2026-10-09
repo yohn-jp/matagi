@@ -35,10 +35,14 @@ func TestHandlerRendersContractStateWithoutUnknownRuntimeData(t *testing.T) {
 	for _, want := range []string{
 		"dev", "Connection · SSH", "Jinushi · process supervisor", "Desired", "Process", "Readiness", "running", "tone-ok", "prefers-color-scheme: light", "aria-busy", "Live · updates every 3 seconds", "setInterval(refresh,3000)", "Start", "Restart", "Stop",
 		"Dashboard", "available", "Tunnel: ready", "Open",
+		`action="/settings/locale"`, `name="returnTo" value="/"`, `id="ui-locale"`, `<option value="en"`, `<option value="ja"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page lacks %q", want)
 		}
+	}
+	if strings.Contains(body, `name="location" value="window"`) {
+		t.Fatal("nil-Presenter production page exposed an unsupported window action")
 	}
 	for _, forbidden := range []string{"run-secret", "credential-secret", "987654", "43123", "environment error", "process warning", "readiness warning"} {
 		if strings.Contains(body, forbidden) {
@@ -124,6 +128,25 @@ func TestWorkspaceTemplateHasJapaneseCopyForEveryLiteralMessage(t *testing.T) {
 	for _, match := range messageID.FindAllStringSubmatch(pageHTML, -1) {
 		if !i18n.Japanese.Has(match[1]) {
 			t.Errorf("workspace message %q has no Japanese catalog entry", match[1])
+		}
+	}
+}
+
+func TestTrustedTemplatesHaveJapaneseCopyForEveryLiteralMessage(t *testing.T) {
+	messageID := regexp.MustCompile(`\{\{t \$?\.Locale "([^"]+)"`)
+	for _, surface := range []struct {
+		name string
+		html string
+	}{
+		{name: "Workspace", html: pageHTML},
+		{name: "shared chrome", html: chromeHTML},
+		{name: "Settings", html: settingsHTML},
+		{name: "Updates", html: updatesHTML},
+	} {
+		for _, match := range messageID.FindAllStringSubmatch(surface.html, -1) {
+			if !i18n.Japanese.Has(match[1]) {
+				t.Errorf("%s message %q has no Japanese catalog entry", surface.name, match[1])
+			}
 		}
 	}
 }
@@ -260,7 +283,7 @@ func TestHandlerLifecycleActionsSendOneMatchingRequest(t *testing.T) {
 		}
 		response := httptest.NewRecorder()
 		h.ServeHTTP(response, formRequest(http.MethodPost, "/action", form, token))
-		if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/" {
+		if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/?environmentId=dev" {
 			t.Fatalf("%s status = %d, location %q, body %s", action, response.Code, response.Header().Get("Location"), response.Body.String())
 		}
 	}
@@ -329,6 +352,25 @@ func TestHandlerEnsuresBeforeAdmittingAndRedirectingEndpoint(t *testing.T) {
 	}
 }
 
+func TestHandlerWithoutLegacyAdmitterKeepsExistingNavigationFailure(t *testing.T) {
+	const endpointURL = "http://127.0.0.1:43123/ui/"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"version":1,"endpoint":{"id":"dash","label":"Dashboard","endpointState":"available","tunnelState":"ready","localUrl":%q,"failure":""}}`, endpointURL)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testHandler(t, client, nil)
+	response := httptest.NewRecorder()
+	form := url.Values{"environmentId": {"dev"}, "serviceId": {"svc"}, "endpointId": {"dash"}}
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/open", form, h.token))
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "The desktop navigation policy is unavailable.") || response.Header().Get("Location") != "" {
+		t.Fatalf("missing-admitter legacy response = %d, Location=%q, body=%s", response.Code, response.Header().Get("Location"), response.Body.String())
+	}
+}
+
 func TestHandlerDoesNotOpenUnavailableOrUnadmittedEndpoint(t *testing.T) {
 	for _, test := range []struct {
 		name        string
@@ -389,7 +431,7 @@ func TestStateChangingFormsRequireTokenAndErrorPagesKeepSecurityHeaders(t *testi
 	if response.Code != http.StatusBadGateway || response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("error response headers = %#v", response.Header())
 	}
-	if body := response.Body.String(); !strings.Contains(body, "Request could not be completed") || !strings.Contains(body, `href="/">Return to Workspace</a>`) || !strings.Contains(body, "Workspace status is unavailable.") || strings.Contains(body, "Loading the Matagi workspace") || strings.Contains(body, `id="sync-text"`) {
+	if body := response.Body.String(); !strings.Contains(body, "Request could not be completed") || !strings.Contains(body, `href="/workspace">Return to Workspace</a>`) || !strings.Contains(body, "Workspace status is unavailable.") || strings.Contains(body, "Loading the Matagi workspace") || strings.Contains(body, `id="sync-text"`) {
 		t.Fatalf("error page should offer a return without implying an endless load: %s", body)
 	}
 }
@@ -460,6 +502,12 @@ func TestLocaleReturnPathIsRestrictedAndUnsupportedSelectionIsRejected(t *testin
 	h.ServeHTTP(response, formRequest(http.MethodPost, "/settings/locale", form, h.token))
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "English または 日本語を選択してください。") {
 		t.Fatalf("unsupported locale response = %d, %s", response.Code, response.Body.String())
+	}
+	form = url.Values{"locale": {"fr"}, "returnTo": {"/settings"}}
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, formRequest(http.MethodPost, "/settings/locale", form, h.token))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "<h1>設定</h1>") || !strings.Contains(response.Body.String(), "English または 日本語を選択してください。") {
+		t.Fatalf("Settings locale error did not return to Settings: %d, %s", response.Code, response.Body.String())
 	}
 }
 

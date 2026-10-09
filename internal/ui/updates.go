@@ -59,12 +59,13 @@ type updatesPageData struct {
 	Error     string
 	ErrorHint string
 	Upd       *UpdatesView
+	Chrome    chromeData
 }
 
 //go:embed updates.html
 var updatesHTML string
 
-var updatesTemplate = template.Must(template.New("updates").Funcs(updatesTemplateFuncs()).Parse(updatesHTML))
+var updatesTemplate = mustParseTemplates("updates", updatesHTML, updatesTemplateFuncs(), chromeHTML)
 
 func updatesTemplateFuncs() template.FuncMap {
 	funcs := template.FuncMap{
@@ -276,16 +277,41 @@ func updateTime(value time.Time) string {
 // updatesPage renders only local update state. It never checks for releases.
 func (h *handler) updatesPage(w http.ResponseWriter, r *http.Request) {
 	if h.updates == nil {
+		if !h.selectTrusted(w, TrustedUpdates) {
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
 	h.renderUpdates(w, "")
 }
 
+// updatesRefreshPage is an observational poll response. It renders current
+// state without changing which trusted destination is visible in the host.
+func (h *handler) updatesRefreshPage(w http.ResponseWriter, r *http.Request) {
+	if h.updates == nil {
+		http.NotFound(w, r)
+		return
+	}
+	h.renderUpdatesResponse(w, http.StatusOK, "")
+}
+
 func (h *handler) renderUpdates(w http.ResponseWriter, message string) {
-	data := updatesPageData{Locale: h.locale(), Token: h.token, Error: bounded(message, maxErrorMessage), Upd: h.updatesView()}
+	h.renderUpdatesStatus(w, http.StatusOK, message)
+}
+
+func (h *handler) renderUpdatesStatus(w http.ResponseWriter, status int, message string) {
+	if !h.selectTrusted(w, TrustedUpdates) {
+		return
+	}
+	h.renderUpdatesResponse(w, status, message)
+}
+
+func (h *handler) renderUpdatesResponse(w http.ResponseWriter, status int, message string) {
+	data := updatesPageData{Locale: h.locale(), Token: h.token, Error: bounded(message, maxErrorMessage), Upd: h.updatesView(), Chrome: h.chrome("updates")}
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
 	if err := updatesTemplate.Execute(w, data); err != nil {
 		return
 	}
@@ -337,7 +363,10 @@ func (h *handler) completeUpdateAction(w http.ResponseWriter, r *http.Request, e
 }
 
 func (h *handler) renderUpdateFailure(w http.ResponseWriter, err error, hint string) {
-	data := updatesPageData{Locale: h.locale(), Token: h.token, Error: bounded(err.Error(), maxErrorMessage), ErrorHint: hint, Upd: h.updatesView()}
+	if !h.selectTrusted(w, TrustedUpdates) {
+		return
+	}
+	data := updatesPageData{Locale: h.locale(), Token: h.token, Error: bounded(err.Error(), maxErrorMessage), ErrorHint: hint, Upd: h.updatesView(), Chrome: h.chrome("updates")}
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if executeErr := updatesTemplate.Execute(w, data); executeErr != nil {

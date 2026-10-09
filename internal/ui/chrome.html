@@ -1,0 +1,83 @@
+{{define "chrome"}}
+<a class="skip" href="#content">{{t .Locale "Skip to content"}}</a>
+<header class="app-chrome">
+  <nav class="chrome-nav" aria-label="{{t .Locale "Matagi navigation"}}">
+    <a class="chrome-brand" href="/workspace">Matagi</a>
+    <div class="chrome-nav-links">
+      <a href="/workspace" {{if eq .Active "workspace"}}aria-current="page"{{end}}>{{t .Locale "Workspace"}}</a>
+      <a href="/updates" {{if eq .Active "updates"}}aria-current="page"{{end}}>{{t .Locale "Updates"}}</a>
+      <a href="/settings" {{if eq .Active "settings"}}aria-current="page"{{end}}>{{t .Locale "Settings"}}</a>
+    </div>
+  </nav>
+  <div class="chrome-view-row">
+    <form class="service-tabs" method="post" action="/presentation/select">
+      <input type="hidden" name="token" value="{{.Token}}">
+      <div class="service-tabs-list" role="tablist" aria-label="{{t .Locale "Service views"}}">
+        {{range .Views}}
+          <button class="service-tab" type="submit" role="tab" data-integrated-view="true" name="viewId" value="{{.ID}}" aria-selected="{{if .Selected}}true{{else}}false{{end}}" aria-label="{{t $.Locale "Select view: %s · %s · %s" .Key.EnvironmentID .Key.ServiceID .Key.EndpointID}}" title="{{.Key.EnvironmentID}} · {{.Key.ServiceID}} · {{.Key.EndpointID}}">
+            <span class="service-tab-label">{{.Key.ServiceID}} · {{.Key.EnvironmentID}}</span>
+            <span class="service-tab-endpoint id">{{.Key.EndpointID}}</span>
+            <span class="badge {{if eq .State "created"}}tone-ok{{else if or (eq .State "pending") (eq .State "moving")}}tone-active{{else if or (eq .State "failed") (eq .State "unavailable")}}tone-bad{{else}}tone-idle{{end}}">{{viewState $.Locale .State}}</span>
+          </button>
+        {{else}}
+          <span class="empty service-tabs-empty">{{t .Locale "No service tabs are open."}}</span>
+        {{end}}
+      </div>
+    </form>
+    {{with .SelectedView}}
+      <div class="service-view-actions" aria-label="{{t $.Locale "Selected service view actions"}}">
+        {{if eq .State "created"}}
+          <form class="inline" method="post" action="/presentation/move">
+            <input type="hidden" name="token" value="{{$.Token}}">
+            <input type="hidden" name="viewId" value="{{.ID}}">
+            {{if eq .Location "tab"}}
+              <button class="btn quiet" type="submit" name="target" value="window">{{t $.Locale "Move to window"}}</button>
+            {{else}}
+              <button class="btn quiet" type="submit" name="target" value="tab">{{t $.Locale "Return to tabs"}}</button>
+            {{end}}
+          </form>
+        {{else if or (eq .State "parked") (eq .State "failed") (eq .State "unavailable")}}
+          <form class="inline" method="post" action="/presentation/resume">
+            <input type="hidden" name="token" value="{{$.Token}}">
+            <input type="hidden" name="environmentId" value="{{.Key.EnvironmentID}}">
+            <input type="hidden" name="serviceId" value="{{.Key.ServiceID}}">
+            <input type="hidden" name="endpointId" value="{{.Key.EndpointID}}">
+            <input type="hidden" name="location" value="{{.Location}}">
+            <button class="btn" type="submit">{{t $.Locale "Resume"}}</button>
+          </form>
+        {{end}}
+        <form class="inline" method="post" action="/presentation/close" data-close-selected>
+          <input type="hidden" name="token" value="{{$.Token}}">
+          <input type="hidden" name="viewId" value="{{.ID}}">
+          <button class="btn quiet" type="submit">{{t $.Locale "Close view"}}</button>
+        </form>
+      </div>
+    {{end}}
+  </div>
+</header>
+<script>
+(function(){
+  var tabs=Array.prototype.slice.call(document.querySelectorAll('[role="tab"][data-integrated-view="true"]'));
+  tabs.forEach(function(tab,index){tab.addEventListener('keydown',function(event){
+    var next=-1;
+    if(event.key==='ArrowRight')next=(index+1)%tabs.length;
+    else if(event.key==='ArrowLeft')next=(index+tabs.length-1)%tabs.length;
+    else if(event.key==='Home')next=0;
+    else if(event.key==='End')next=tabs.length-1;
+    if(next>=0&&tabs.length){event.preventDefault();tabs[next].focus();}
+  });});
+  document.addEventListener('keydown',function(event){
+    if(event.altKey||event.metaKey)return;
+    if(event.ctrlKey&&event.key==='Tab'&&tabs.length){
+      event.preventDefault();
+      var selected=tabs.findIndex(function(tab){return tab.getAttribute('aria-selected')==='true';});
+      var next=selected<0?(event.shiftKey?tabs.length-1:0):(selected+(event.shiftKey?-1:1)+tabs.length)%tabs.length;
+      tabs[next].click();
+    }else if(event.ctrlKey&&event.key.toLowerCase()==='w'){
+      var close=document.querySelector('[data-close-selected]');
+      if(close){event.preventDefault();close.requestSubmit();}
+    }
+  });
+})();
+</script>
+{{end}}

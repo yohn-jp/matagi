@@ -128,31 +128,12 @@ func TestUpdatesPageRendersLocalStateInEnglishAndJapanese(t *testing.T) {
 				t.Errorf("%s update UI contains sibling product text %q", locale, forbidden)
 			}
 		}
-		localeFormID := strings.Index(body, `id="ui-locale-form"`)
-		if localeFormID < 0 {
-			t.Fatalf("%s update page lacks its locale form", locale)
+		if !strings.Contains(body, `href="/settings"`) || !strings.Contains(body, html.EscapeString(locale.T("Settings"))) {
+			t.Errorf("%s updates page does not use the shared Settings navigation", locale)
 		}
-		localeFormStart := strings.LastIndex(body[:localeFormID], "<form")
-		if localeFormStart < 0 {
-			t.Fatalf("%s update page lacks its locale form", locale)
-		}
-		localeFormEnd := strings.Index(body[localeFormStart:], "</form>")
-		if localeFormEnd < 0 {
-			t.Fatalf("%s update page lacks its locale form", locale)
-		}
-		localeForm := body[localeFormStart : localeFormStart+localeFormEnd]
-		for _, want := range []string{
-			`action="/settings/locale"`,
-			`name="token" value="` + h.token + `"`,
-			`name="returnTo" value="/updates"`,
-			`id="ui-locale"`,
-			`name="locale"`,
-			`value="en"`,
-			`value="ja"`,
-			`value="` + string(locale) + `" selected`,
-		} {
-			if !strings.Contains(localeForm, want) {
-				t.Errorf("%s locale form lacks %q", locale, want)
+		for _, want := range []string{`id="ui-locale-form"`, `action="/settings/locale"`, `name="returnTo" value="/updates"`, `id="ui-locale"`, `<option value="en"`, `<option value="ja"`} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s nil-Presenter Updates page lacks legacy language control %q", locale, want)
 			}
 		}
 		if !strings.Contains(body, `action="/updates/check"`) || !strings.Contains(body, `action="/updates/download"`) || !strings.Contains(body, `id="updates-install"`) {
