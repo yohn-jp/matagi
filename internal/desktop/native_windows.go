@@ -230,9 +230,9 @@ func (native) Open(ctx context.Context, w Window) error {
 	}
 	s.activateMsg = uint32(activateMessageID)
 	activeShellMu.Lock()
-	if activeShell != nil {
+	if activeShell != nil || activeViewsHost != nil {
 		activeShellMu.Unlock()
-		return errors.New("a Matagi desktop window is already open")
+		return errors.New("a Matagi desktop host is already open")
 	}
 	activeShell = s
 	activeShellMu.Unlock()
@@ -377,6 +377,9 @@ func (native) Open(ctx context.Context, w Window) error {
 }
 
 func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
+	if owner, ok := ownerForWindow(hwnd); ok {
+		return owner.host.windowProc(hwnd, owner, message, wParam, lParam)
+	}
 	activeShellMu.Lock()
 	s := activeShell
 	activeShellMu.Unlock()
