@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -565,10 +566,11 @@ func TestStartDesiredStateCausesPollToRecreateHealthTunnel(t *testing.T) {
 	}
 }
 
-func TestDesiredStateMutationSerializesSnapshotWithLifecycleAction(t *testing.T) {
+func TestSnapshotRemainsResponsiveDuringLifecycleRemoteIO(t *testing.T) {
 	r, client, _ := lifecycleRuntime(t, registry.DesiredStopped)
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
 	base := client.fn
 	client.fn = func(args []string) (ssh.Result, error) {
 		if args[1] == "run" {
@@ -579,32 +581,699 @@ func TestDesiredStateMutationSerializesSnapshotWithLifecycleAction(t *testing.T)
 	}
 
 	started := make(chan error, 1)
+	startFinished := false
 	go func() {
 		_, err := r.Start(context.Background(), "env", "svc")
 		started <- err
 	}()
 	<-entered
-	observed := make(chan registry.DesiredState, 1)
-	snapshotStarted := make(chan struct{})
-	go func() {
-		close(snapshotStarted)
-		observed <- r.Snapshot().Environments[0].Services[0].DesiredState
-	}()
-	<-snapshotStarted
-	early := false
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		if !startFinished {
+			select {
+			case <-started:
+			case <-time.After(3 * time.Second):
+				t.Error("blocked Start did not finish during cleanup")
+			}
+		}
+	})
+	observed := make(chan State, 1)
+	go func() { observed <- r.Snapshot() }()
 	select {
-	case <-observed:
-		early = true
-	case <-time.After(20 * time.Millisecond):
+	case snapshot := <-observed:
+		if got := snapshot.Environments[0].Services[0].DesiredState; got != registry.DesiredStopped {
+			t.Fatalf("Snapshot() desired state during unresolved Start = %q, want stopped", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Snapshot() waited for remote Start I/O")
 	}
-	close(release)
+	releaseOnce.Do(func() { close(release) })
 	if err := <-started; err != nil {
+		startFinished = true
 		t.Fatalf("Start(): %v", err)
 	}
-	if early {
-		t.Fatal("Snapshot() returned while Start was unresolved")
-	}
-	if got := <-observed; got != registry.DesiredRunning {
+	startFinished = true
+	if got := r.Snapshot().Environments[0].Services[0].DesiredState; got != registry.DesiredRunning {
 		t.Fatalf("Snapshot() desired state = %q after Start, want running", got)
 	}
+}
+
+func TestSlowPollDoesNotBlockSnapshotOrUnrelatedServiceControl(t *testing.T) {
+	r, client, _ := lifecycleRuntime(t, registry.DesiredStopped)
+	fast := r.registry.Services()[0]
+	fast.ID = "fast"
+	fast.Execution.Argv = []string{"fast-service"}
+	fast.Execution.CWD = "/work/fast"
+	if err := r.AddService(fast); err != nil {
+		t.Fatalf("AddService(fast): %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	base := client.fn
+	client.fn = func(args []string) (ssh.Result, error) {
+		if len(args) == 1 && args[0] == "true" {
+			close(entered)
+			<-release // Simulate a late transport return after Runtime cancels Poll.
+			return ssh.Result{ExitCode: 0}, nil
+		}
+		return base(args)
+	}
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- r.Poll(context.Background()) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Poll did not reach the blocked connectivity probe")
+	}
+	var startDone chan error
+	pollFinished := false
+	startFinished := false
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		if !pollFinished {
+			select {
+			case <-pollDone:
+			case <-time.After(3 * time.Second):
+				t.Error("blocked Poll did not finish during cleanup")
+			}
+		}
+		if startDone != nil && !startFinished {
+			select {
+			case <-startDone:
+			case <-time.After(3 * time.Second):
+				t.Error("unrelated Start did not finish during cleanup")
+			}
+		}
+	})
+
+	snapshotDone := make(chan State, 1)
+	go func() { snapshotDone <- r.Snapshot() }()
+	select {
+	case snapshot := <-snapshotDone:
+		if len(snapshot.Environments[0].Services) != 2 {
+			t.Fatalf("Snapshot() services = %d, want 2", len(snapshot.Environments[0].Services))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Snapshot() waited for slow Poll I/O")
+	}
+
+	startDone = make(chan error, 1)
+	go func() {
+		_, err := r.Start(context.Background(), "env", "fast")
+		startDone <- err
+	}()
+	select {
+	case err := <-startDone:
+		startFinished = true
+		if err != nil {
+			t.Fatalf("Start(fast) during slow Poll: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("unrelated service Start waited for slow Poll I/O")
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	if err := <-pollDone; err != nil {
+		pollFinished = true
+		t.Fatalf("superseded Poll() error = %v, want a discarded observation", err)
+	}
+	pollFinished = true
+	for _, service := range r.Snapshot().Environments[0].Services {
+		if service.ID == "fast" && service.DesiredState != registry.DesiredRunning {
+			t.Fatalf("fast service desired state = %q after Start", service.DesiredState)
+		}
+	}
+}
+
+func waitForActiveOperations(t *testing.T, r *Runtime, want int) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		r.mu.Lock()
+		active := r.activeOps
+		r.mu.Unlock()
+		if active >= want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("active operations = %d, want at least %d", active, want)
+		case <-ticker.C:
+		}
+	}
+}
+
+type blockingRuntimeLauncher struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (l *blockingRuntimeLauncher) Start(context.Context, tunnel.ForwardSpec) (tunnel.Process, error) {
+	l.once.Do(func() { close(l.entered) })
+	<-l.release
+	return newTrackingProcess(), nil
+}
+
+func TestPollStartedDuringLifecycleActionCannotRestoreOldEndpointFailure(t *testing.T) {
+	snapshot, err := registry.NewSnapshot(
+		[]registry.Environment{{ID: "env", SSHHost: "host", Jinushi: registry.JinushiDefinition{StateDir: "/state"}}},
+		[]registry.Service{{
+			ID: "svc", EnvironmentID: "env", DesiredState: registry.DesiredStopped,
+			Execution: registry.ExecutionIntent{Argv: []string{"service"}, CWD: "/work", Lifetime: registry.LifetimeDetached},
+			Health:    registry.HealthDefinition{Type: registry.HealthHTTP, EndpointID: "health", Path: "/ready"},
+			Endpoints: []registry.Endpoint{
+				{ID: "health", Label: "Health", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: 1234},
+				{ID: "ui", Label: "UI", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: 1235},
+			},
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeSSH{fn: func(args []string) (ssh.Result, error) {
+		if len(args) == 1 && args[0] == "true" {
+			return ssh.Result{ExitCode: 0}, nil
+		}
+		switch args[1] {
+		case "status":
+			return ssh.Result{Stdout: []byte(`{"version":1,"status":{}}`)}, nil
+		case "list":
+			return ssh.Result{Stdout: []byte(`{"version":1,"runs":[],"nextCursor":""}`)}, nil
+		case "run":
+			return ssh.Result{Stdout: lifecycleRunResponse(t, args, "run-new", "accepted")}, nil
+		default:
+			return ssh.Result{}, fmt.Errorf("unexpected Jinushi command %v", args)
+		}
+	}}
+	launcher := &blockingRuntimeLauncher{entered: make(chan struct{}), release: make(chan struct{})}
+	manager, err := tunnel.NewManager(launcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Compose(snapshot, client, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(launcher.release) })
+		_ = r.Close(context.Background())
+	})
+	identity := tunnel.Identity{Environment: "env", Service: "svc", Endpoint: "health"}
+	r.mu.Lock()
+	r.endpointFailures[identity] = "Dynamic endpoint evidence is stale or conflicting."
+	r.mu.Unlock()
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := r.Start(context.Background(), "env", "svc")
+		startDone <- err
+	}()
+	select {
+	case <-launcher.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not reach health tunnel setup after committing running intent")
+	}
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- r.Poll(context.Background()) }()
+	waitForActiveOperations(t, r, 2)
+	deadline := time.NewTimer(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	for {
+		r.mu.Lock()
+		started := r.pollCancel != nil
+		r.mu.Unlock()
+		if started {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("late Poll did not capture its candidate state")
+		case <-ticker.C:
+		}
+	}
+	ticker.Stop()
+	deadline.Stop()
+	releaseOnce.Do(func() { close(launcher.release) })
+	if err := <-startDone; err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	if err := <-pollDone; err != nil {
+		t.Fatalf("late Poll(): %v; internally superseded observations should be discarded", err)
+	}
+	r.mu.Lock()
+	failure := r.endpointFailures[identity]
+	r.mu.Unlock()
+	if failure != "" {
+		t.Fatalf("late Poll restored endpoint failure %q after successful tunnel setup", failure)
+	}
+}
+
+func TestConcurrentRestartRetryKeepsOneSubmissionAndRun(t *testing.T) {
+	r, client, _ := lifecycleRuntime(t, registry.DesiredRunning)
+	owner := r.services[key("env", "svc")].CorrelationOwner()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = r.Close(context.Background())
+	})
+	runs := map[string]string{}
+	createdBySubmission := map[string]string{}
+	currentRun := ""
+	var submissions []string
+	physicalRuns := 0
+	runCalls := 0
+	client.fn = func(args []string) (ssh.Result, error) {
+		if len(args) == 1 && args[0] == "true" {
+			return ssh.Result{ExitCode: 0}, nil
+		}
+		switch args[1] {
+		case "status":
+			return ssh.Result{Stdout: []byte(`{"version":1,"status":{}}`)}, nil
+		case "list":
+			if currentRun == "" {
+				return ssh.Result{Stdout: []byte(`{"version":1,"runs":[],"nextCursor":""}`)}, nil
+			}
+			return ssh.Result{Stdout: []byte(fmt.Sprintf(`{"version":1,"runs":[%s],"nextCursor":""}`, runs[currentRun]))}, nil
+		case "run":
+			var submissionID string
+			for _, arg := range args {
+				if strings.HasPrefix(arg, "--submission-id=") {
+					submissionID = strings.TrimPrefix(arg, "--submission-id=")
+				}
+			}
+			submissions = append(submissions, submissionID)
+			id, exists := createdBySubmission[submissionID]
+			if !exists {
+				id = "run-new"
+				createdBySubmission[submissionID] = id
+				physicalRuns++
+			}
+			runs[id] = fmt.Sprintf(`{"runId":%q,"state":"accepted","generation":1,"createdAt":"2026-10-07T00:00:00Z","spec":{"correlation":{"owner":%q}}}`, id, owner)
+			currentRun = id
+			runCalls++
+			if runCalls == 1 {
+				close(entered)
+				<-release
+				return ssh.Result{ExitCode: -1}, &ssh.Error{Kind: ssh.FailureTransport, Err: errors.New("lost response after remote submission")}
+			}
+			return ssh.Result{Stdout: lifecycleRunResponse(t, args, id, "accepted")}, nil
+		default:
+			return ssh.Result{}, fmt.Errorf("unexpected Jinushi command %v", args)
+		}
+	}
+	type result struct {
+		service Service
+		err     error
+	}
+	firstDone := make(chan result, 1)
+	go func() {
+		service, err := r.Restart(context.Background(), "env", "svc")
+		firstDone <- result{service, err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Restart did not reach its ambiguous submission")
+	}
+	secondDone := make(chan result, 1)
+	go func() {
+		service, err := r.Restart(context.Background(), "env", "svc")
+		secondDone <- result{service, err}
+	}()
+	waitForActiveOperations(t, r, 2)
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case first := <-firstDone:
+		if first.err == nil {
+			t.Fatal("first Restart succeeded despite the lost response")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Restart did not return after the response loss")
+	}
+	select {
+	case second := <-secondDone:
+		if second.err != nil || second.service.Process != "starting" {
+			t.Fatalf("serialized retry Restart() = %#v, %v; want accepted attempted Run", second.service, second.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Restart did not reconcile the retained attempt")
+	}
+	if physicalRuns != 1 || len(submissions) != 2 || submissions[0] == "" || submissions[0] != submissions[1] {
+		t.Fatalf("physical Runs=%d, submission IDs=%v; want one Run under one retained submission", physicalRuns, submissions)
+	}
+}
+
+func TestEnsureWaiterCanBeCanceledBehindLifecycleAction(t *testing.T) {
+	r, client, _ := lifecycleRuntime(t, registry.DesiredStopped)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	base := client.fn
+	client.fn = func(args []string) (ssh.Result, error) {
+		if len(args) > 1 && args[1] == "run" {
+			close(entered)
+			<-release
+		}
+		return base(args)
+	}
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := r.Start(context.Background(), "env", "svc")
+		startDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not reach blocked Jinushi I/O")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	startFinished := false
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		cancel()
+		if !startFinished {
+			select {
+			case <-startDone:
+			case <-time.After(3 * time.Second):
+				t.Error("blocked Start did not finish during cleanup")
+			}
+		}
+		_ = r.Close(context.Background())
+	})
+	ensureDone := make(chan error, 1)
+	go func() {
+		_, err := r.Ensure(ctx, "env", "svc", "ui")
+		ensureDone <- err
+	}()
+	waitForActiveOperations(t, r, 2)
+	cancel()
+	select {
+	case err := <-ensureDone:
+		var failure *Failure
+		if !errors.As(err, &failure) || failure.Code != "operation-canceled" {
+			t.Fatalf("canceled Ensure() = %v; want operation-canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ensure did not leave the service gate after cancellation")
+	}
+	identity := tunnel.Identity{Environment: "env", Service: "svc", Endpoint: "ui"}
+	if _, err := r.tunnels.Get(identity); err == nil {
+		t.Fatal("canceled Ensure started endpoint work after its service gate was canceled")
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-startDone; err != nil {
+		startFinished = true
+		t.Fatalf("Start(): %v", err)
+	}
+	startFinished = true
+}
+
+func TestEnsureJinushiDoesNotPublishAfterRegistryReplacement(t *testing.T) {
+	environments := []registry.Environment{{ID: "env", SSHHost: "host", Jinushi: registry.JinushiDefinition{StateDir: "/state"}}}
+	empty, err := registry.NewSnapshot(environments, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	client := &fakeSSH{fn: func(args []string) (ssh.Result, error) {
+		if len(args) > 1 && args[1] == "status" {
+			close(entered)
+			<-release
+			return ssh.Result{Stdout: []byte(`{"version":1,"status":{}}`)}, nil
+		}
+		return ssh.Result{}, fmt.Errorf("unexpected SSH command %v", args)
+	}}
+	manager, err := tunnel.NewManager(noLauncher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Compose(empty, client, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := config.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(empty); err != nil {
+		t.Fatal(err)
+	}
+	r.store = store
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = r.Close(context.Background())
+	})
+	ensureDone := make(chan error, 1)
+	go func() { ensureDone <- r.EnsureJinushi(context.Background(), "env") }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureJinushi did not reach delayed remote status")
+	}
+	updated, err := registry.NewSnapshot(environments, []registry.Service{{
+		ID: "svc", EnvironmentID: "env", DesiredState: registry.DesiredStopped,
+		Execution: registry.ExecutionIntent{Argv: []string{"service"}, CWD: "/work", Lifetime: registry.LifetimeDetached},
+		Health:    registry.HealthDefinition{Type: registry.HealthHTTP, EndpointID: "health", Path: "/ready"},
+		Endpoints: []registry.Endpoint{{ID: "health", Label: "Health", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: 1234}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(updated); err != nil {
+		t.Fatalf("Register(): %v", err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-ensureDone; err != nil {
+		t.Fatalf("EnsureJinushi(): %v", err)
+	}
+	if got := r.Snapshot().Environments[0].Jinushi; got != "unknown" {
+		t.Fatalf("late EnsureJinushi result published %q after Register; want unknown", got)
+	}
+}
+
+func TestCloseBoundsWaitForBlockedLifecycleOperation(t *testing.T) {
+	r, client, _ := lifecycleRuntime(t, registry.DesiredStopped)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	base := client.fn
+	client.fn = func(args []string) (ssh.Result, error) {
+		if len(args) > 1 && args[1] == "run" {
+			close(entered)
+			<-release // Deliberately ignores Runtime cancellation until released.
+		}
+		return base(args)
+	}
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := r.Start(context.Background(), "env", "svc")
+		startDone <- err
+	}()
+	startFinished := false
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		if !startFinished {
+			select {
+			case <-startDone:
+			case <-time.After(3 * time.Second):
+				t.Error("blocked Start did not finish during cleanup")
+			}
+		}
+		_ = r.Close(context.Background())
+	})
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not reach blocked Jinushi I/O")
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := r.Close(closeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close() = %v; want caller deadline while the remote operation is blocked", err)
+	}
+	snapshotDone := make(chan State, 1)
+	go func() { snapshotDone <- r.Snapshot() }()
+	select {
+	case snapshot := <-snapshotDone:
+		if got := snapshot.Environments[0].Services[0].DesiredState; got != registry.DesiredStopped {
+			t.Fatalf("closed Snapshot desired state = %q; want no post-Close publication", got)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Snapshot waited on the blocked lifecycle operation after Close")
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-startDone; err == nil {
+		startFinished = true
+		t.Fatal("Start succeeded and published after Runtime Close")
+	}
+	startFinished = true
+}
+
+type lateStartingRuntimeLauncher struct {
+	entered  chan struct{}
+	release  chan struct{}
+	process  *trackingProcess
+	startOne sync.Once
+}
+
+func (l *lateStartingRuntimeLauncher) Start(context.Context, tunnel.ForwardSpec) (tunnel.Process, error) {
+	l.startOne.Do(func() { close(l.entered) })
+	<-l.release
+	return l.process, nil
+}
+
+func TestCloseReapsTunnelWhoseLauncherSucceedsAfterCloseDeadline(t *testing.T) {
+	snapshot, err := registry.NewSnapshot(
+		[]registry.Environment{{ID: "env", SSHHost: "host", Jinushi: registry.JinushiDefinition{StateDir: "/state"}}},
+		[]registry.Service{{
+			ID: "svc", EnvironmentID: "env", DesiredState: registry.DesiredStopped,
+			Execution: registry.ExecutionIntent{Argv: []string{"service"}, CWD: "/work", Lifetime: registry.LifetimeDetached},
+			Health:    registry.HealthDefinition{Type: registry.HealthHTTP, EndpointID: "health", Path: "/ready"},
+			Endpoints: []registry.Endpoint{
+				{ID: "health", Label: "Health", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: 1234},
+				{ID: "ui", Label: "UI", RemoteAddress: registry.RemoteLoopbackAddress, RemotePort: 1235},
+			},
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeSSH{fn: func([]string) (ssh.Result, error) { return ssh.Result{}, errors.New("unexpected SSH call") }}
+	launcher := &lateStartingRuntimeLauncher{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		process: newTrackingProcess(),
+	}
+	manager, err := tunnel.NewManager(launcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Compose(snapshot, client, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var releaseOnce sync.Once
+	ensureDone := make(chan error, 1)
+	go func() {
+		_, err := r.Ensure(context.Background(), "env", "svc", "ui")
+		ensureDone <- err
+	}()
+	ensureFinished := false
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(launcher.release) })
+		if !ensureFinished {
+			select {
+			case <-ensureDone:
+			case <-time.After(3 * time.Second):
+				t.Error("Ensure did not finish during cleanup")
+			}
+		}
+		_ = r.Close(context.Background())
+	})
+	select {
+	case <-launcher.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ensure did not reach the blocked tunnel launcher")
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := r.Close(closeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close() = %v; want caller deadline while tunnel launch is blocked", err)
+	}
+	releaseOnce.Do(func() { close(launcher.release) })
+	select {
+	case err := <-ensureDone:
+		ensureFinished = true
+		if err == nil {
+			t.Fatal("Ensure succeeded after Runtime Close canceled its tunnel launch")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ensure did not finish after the late launcher returned")
+	}
+	select {
+	case <-launcher.process.stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late tunnel process was not stopped and reaped")
+	}
+	identity := tunnel.Identity{Environment: "env", Service: "svc", Endpoint: "ui"}
+	got, err := r.tunnels.Get(identity)
+	if err != nil || got.State != tunnel.StateStopped {
+		t.Fatalf("late tunnel state = %#v, %v; want stopped with no owned ready tunnel", got, err)
+	}
+}
+
+func TestRunContinuesAfterInternallySupersededPoll(t *testing.T) {
+	r, client, _ := lifecycleRuntime(t, registry.DesiredStopped)
+	fast := r.registry.Services()[0]
+	fast.ID = "fast"
+	fast.Execution.Argv = []string{"fast-service"}
+	fast.Execution.CWD = "/work/fast"
+	if err := r.AddService(fast); err != nil {
+		t.Fatalf("AddService(fast): %v", err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	base := client.fn
+	client.fn = func(args []string) (ssh.Result, error) {
+		if len(args) == 1 && args[0] == "true" {
+			close(entered)
+			<-release
+			return ssh.Result{ExitCode: 0}, nil
+		}
+		return base(args)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- r.Run(runCtx) }()
+	runFinished := false
+	t.Cleanup(func() {
+		cancelRun()
+		releaseOnce.Do(func() { close(release) })
+		if !runFinished {
+			select {
+			case <-runDone:
+			case <-time.After(3 * time.Second):
+				t.Error("Run did not stop during cleanup")
+			}
+		}
+		_ = r.Close(context.Background())
+	})
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not begin its slow Poll")
+	}
+	if _, err := r.Start(context.Background(), "env", "fast"); err != nil {
+		t.Fatalf("unrelated Start during slow Run Poll: %v", err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 2*time.Second)
+	pollRelease, err := acquireGate(waitCtx, r.pollGate)
+	cancelWait()
+	if err != nil {
+		t.Fatalf("wait for superseded Poll completion: %v", err)
+	}
+	pollRelease()
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run exited after an internally superseded Poll: %v", err)
+	default:
+	}
+	cancelRun()
+	if err := <-runDone; err != nil {
+		runFinished = true
+		t.Fatalf("Run after caller cancellation: %v", err)
+	}
+	runFinished = true
 }

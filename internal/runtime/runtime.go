@@ -23,6 +23,8 @@ import (
 const commandTimeout = 10 * time.Second
 const probeTimeout = 3 * time.Second
 
+var errRuntimeClosed = errors.New("runtime closed")
+
 type Failure struct {
 	Code     string
 	Evidence string
@@ -126,8 +128,17 @@ type pendingSubmission struct {
 	submissionID string
 	restart      jinushi.RestartAttempt
 }
+type probeInputs struct {
+	ssh              remoteRunner
+	bindings         map[string]binding
+	services         map[string]registry.Service
+	tunnels          *tunnel.Manager
+	httpClient       *http.Client
+	endpointFailures map[tunnel.Identity]string
+}
 type Runtime struct {
 	mu               sync.Mutex
+	registryMu       sync.Mutex
 	registry         *registry.Snapshot
 	store            *config.Store
 	ssh              remoteRunner
@@ -140,9 +151,156 @@ type Runtime struct {
 	endpointFailures map[tunnel.Identity]string
 	closed           bool
 	httpClient       *http.Client
+	shutdownCtx      context.Context
+	shutdownCancel   context.CancelFunc
+	activeOps        int
+	activeDone       chan struct{}
+	pollGate         chan struct{}
+	pollCancel       context.CancelFunc
+	pollVersion      uint64
+	configVersion    uint64
+	serviceVersions  map[string]uint64
+	environmentGates map[string]chan struct{}
+	serviceGates     map[string]chan struct{}
 }
 
 func key(env, service string) string { return env + "\x00" + service }
+
+func closedSignal() chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+
+func (r *Runtime) beginOperation(ctx context.Context) (context.Context, func(), error) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, nil, errRuntimeClosed
+	}
+	if r.activeOps == 0 {
+		r.activeDone = make(chan struct{})
+	}
+	r.activeOps++
+	shutdownCtx := r.shutdownCtx
+	r.mu.Unlock()
+
+	opCtx, cancel := context.WithCancel(ctx)
+	stopShutdown := context.AfterFunc(shutdownCtx, cancel)
+	var once sync.Once
+	end := func() {
+		once.Do(func() {
+			stopShutdown()
+			cancel()
+			r.mu.Lock()
+			r.activeOps--
+			if r.activeOps == 0 {
+				close(r.activeDone)
+			}
+			r.mu.Unlock()
+		})
+	}
+	return opCtx, end, nil
+}
+
+func (r *Runtime) invalidatePollLocked() context.CancelFunc {
+	r.pollVersion++
+	return r.pollCancel
+}
+
+func (r *Runtime) serviceGateLocked(serviceKey string) chan struct{} {
+	if r.serviceGates == nil {
+		r.serviceGates = map[string]chan struct{}{}
+	}
+	gate := r.serviceGates[serviceKey]
+	if gate == nil {
+		gate = make(chan struct{}, 1)
+		r.serviceGates[serviceKey] = gate
+	}
+	return gate
+}
+
+func (r *Runtime) environmentGateLocked(environment string) chan struct{} {
+	if r.environmentGates == nil {
+		r.environmentGates = map[string]chan struct{}{}
+	}
+	gate := r.environmentGates[environment]
+	if gate == nil {
+		gate = make(chan struct{}, 1)
+		r.environmentGates[environment] = gate
+	}
+	return gate
+}
+
+func acquireGate(ctx context.Context, gate chan struct{}) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (r *Runtime) acquireServiceGate(ctx context.Context, serviceKey string) (func(), error) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errRuntimeClosed
+	}
+	gate := r.serviceGateLocked(serviceKey)
+	r.mu.Unlock()
+	return acquireGate(ctx, gate)
+}
+
+func (r *Runtime) acquireEnvironmentGate(ctx context.Context, environment string) (func(), error) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errRuntimeClosed
+	}
+	gate := r.environmentGateLocked(environment)
+	r.mu.Unlock()
+	return acquireGate(ctx, gate)
+}
+
+func cloneBindings(bindings map[string]binding) map[string]binding {
+	result := make(map[string]binding, len(bindings))
+	for id, value := range bindings {
+		result[id] = value
+	}
+	return result
+}
+
+func cloneServices(services map[string]registry.Service) map[string]registry.Service {
+	result := make(map[string]registry.Service, len(services))
+	for id, value := range services {
+		result[id] = value
+	}
+	return result
+}
+
+func cloneEndpointFailures(failures map[tunnel.Identity]string) map[tunnel.Identity]string {
+	result := make(map[tunnel.Identity]string, len(failures))
+	for identity, value := range failures {
+		result[identity] = value
+	}
+	return result
+}
+
+func (r *Runtime) captureInputsLocked() probeInputs {
+	return probeInputs{
+		ssh:              r.ssh,
+		bindings:         cloneBindings(r.bindings),
+		services:         cloneServices(r.services),
+		tunnels:          r.tunnels,
+		httpClient:       r.httpClient,
+		endpointFailures: cloneEndpointFailures(r.endpointFailures),
+	}
+}
+
 func New(store *config.Store) (*Runtime, error) {
 	snapshot, err := loadSnapshot(store)
 	if err != nil {
@@ -184,7 +342,22 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 	if snapshot == nil || client == nil || manager == nil {
 		return nil, errors.New("registry, SSH client and tunnel manager are required")
 	}
-	r := &Runtime{ssh: client, tunnels: manager, pending: map[string]pendingSubmission{}, jinushi: map[string]string{}, endpointFailures: map[tunnel.Identity]string{}, httpClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	r := &Runtime{
+		ssh:              client,
+		tunnels:          manager,
+		pending:          map[string]pendingSubmission{},
+		jinushi:          map[string]string{},
+		endpointFailures: map[tunnel.Identity]string{},
+		httpClient:       &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		shutdownCtx:      shutdownCtx,
+		shutdownCancel:   shutdownCancel,
+		activeDone:       closedSignal(),
+		pollGate:         make(chan struct{}, 1),
+		serviceVersions:  map[string]uint64{},
+		serviceGates:     map[string]chan struct{}{},
+		environmentGates: map[string]chan struct{}{},
+	}
 	if err := r.configure(snapshot); err != nil {
 		return nil, err
 	}
@@ -192,16 +365,9 @@ func Compose(snapshot *registry.Snapshot, client remoteRunner, manager *tunnel.M
 }
 
 func (r *Runtime) configure(snapshot *registry.Snapshot) error {
-	r.registry = snapshot
-	r.jinushi = map[string]string{}
-	if r.endpointFailures == nil {
-		r.endpointFailures = map[tunnel.Identity]string{}
-	}
-	r.bindings = map[string]binding{}
-	r.services = map[string]registry.Service{}
+	bindings := map[string]binding{}
+	services := map[string]registry.Service{}
 	client := r.ssh
-	targets := []health.EnvironmentTarget{}
-	observerProbeTimeout := probeTimeout
 	for _, env := range snapshot.Environments() {
 		ex := executor{client: client, host: env.SSHHost}
 		opts := jinushi.Options{StateDir: env.Jinushi.StateDir, SupervisorStartCommand: env.Jinushi.SupervisorStartCommand, CommandTimeout: commandTimeout}
@@ -214,19 +380,53 @@ func (r *Runtime) configure(snapshot *registry.Snapshot) error {
 		if err != nil {
 			return err
 		}
-		r.bindings[string(env.ID)] = binding{env, control, observe}
-		targets = append(targets, health.EnvironmentTarget{ID: string(env.ID)})
+		bindings[string(env.ID)] = binding{env, control, observe}
 	}
 	for _, service := range snapshot.Services() {
-		configuredTimeout := time.Duration(*service.Health.TimeoutMS) * time.Millisecond
-		if configuredTimeout >= observerProbeTimeout {
-			observerProbeTimeout = configuredTimeout + time.Second
-		}
 		e, s := string(service.EnvironmentID), string(service.ID)
-		r.services[key(e, s)] = service
+		services[key(e, s)] = service
+	}
+	if r.endpointFailures == nil {
+		r.endpointFailures = map[tunnel.Identity]string{}
+	}
+	inputs := probeInputs{
+		ssh:              client,
+		bindings:         cloneBindings(bindings),
+		services:         cloneServices(services),
+		tunnels:          r.tunnels,
+		httpClient:       r.httpClient,
+		endpointFailures: cloneEndpointFailures(r.endpointFailures),
+	}
+	observer, err := r.newObserver(snapshot, inputs)
+	if err != nil {
+		return err
+	}
+	r.registry = snapshot
+	r.bindings = bindings
+	r.services = services
+	r.jinushi = map[string]string{}
+	r.observer = observer
+	r.configVersion++
+	if cancelPoll := r.invalidatePollLocked(); cancelPoll != nil {
+		cancelPoll()
+	}
+	return nil
+}
+
+func (r *Runtime) newObserver(snapshot *registry.Snapshot, inputs probeInputs) (*health.Observer, error) {
+	targets := make([]health.EnvironmentTarget, 0)
+	for _, environment := range snapshot.Environments() {
+		targets = append(targets, health.EnvironmentTarget{ID: string(environment.ID)})
+	}
+	probeTimeoutForObserver := probeTimeout
+	for _, service := range snapshot.Services() {
+		configuredTimeout := time.Duration(*service.Health.TimeoutMS) * time.Millisecond
+		if configuredTimeout >= probeTimeoutForObserver {
+			probeTimeoutForObserver = configuredTimeout + time.Second
+		}
 		for i := range targets {
-			if targets[i].ID == e {
-				target := health.ServiceTarget{ID: s}
+			if targets[i].ID == string(service.EnvironmentID) {
+				target := health.ServiceTarget{ID: string(service.ID)}
 				for _, endpoint := range service.Endpoints {
 					target.Endpoints = append(target.Endpoints, health.EndpointTarget{ID: string(endpoint.ID)})
 				}
@@ -235,12 +435,36 @@ func (r *Runtime) configure(snapshot *registry.Snapshot) error {
 			}
 		}
 	}
-	observer, err := health.New(targets, health.Probes{Connectivity: r.connectivity, Process: r.process, Readiness: r.readiness, Endpoint: r.endpointState}, health.Options{PollInterval: 5 * time.Second, ProbeTimeout: observerProbeTimeout})
-	if err != nil {
-		return err
+	probes := health.Probes{
+		Connectivity: func(ctx context.Context, env string) (health.ConnectivityState, error) {
+			return r.connectivityWith(ctx, inputs, env)
+		},
+		Process: func(ctx context.Context, env, id string) (health.ProcessState, error) {
+			release, err := r.acquireServiceGate(ctx, key(env, id))
+			if err != nil {
+				return health.ProcessUnknown, err
+			}
+			defer release()
+			return r.processWith(ctx, inputs, env, id)
+		},
+		Readiness: func(ctx context.Context, env, id string) (health.ReadinessState, error) {
+			release, err := r.acquireServiceGate(ctx, key(env, id))
+			if err != nil {
+				return health.ReadinessUnknown, err
+			}
+			defer release()
+			return r.readinessWith(ctx, inputs, env, id)
+		},
+		Endpoint: func(ctx context.Context, env, id, endpoint string) (health.EndpointState, error) {
+			release, err := r.acquireServiceGate(ctx, key(env, id))
+			if err != nil {
+				return health.EndpointUnknown, err
+			}
+			defer release()
+			return r.endpointStateWith(ctx, inputs, env, id, endpoint)
+		},
 	}
-	r.observer = observer
-	return nil
+	return health.New(targets, probes, health.Options{PollInterval: 5 * time.Second, ProbeTimeout: probeTimeoutForObserver})
 }
 
 func equalArgv(a, b []string) bool {
@@ -261,9 +485,16 @@ func (r *Runtime) Register(snapshot *registry.Snapshot) error {
 	if snapshot == nil {
 		return &Failure{Code: "invalid-request"}
 	}
+	opCtx, finish, err := r.beginOperation(context.Background())
+	if err != nil {
+		return &Failure{Code: "lifecycle-conflict"}
+	}
+	defer finish()
+	r.registryMu.Lock()
+	defer r.registryMu.Unlock()
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return &Failure{Code: "lifecycle-conflict"}
 	}
 	// An environment-only first draft may be completed with service definitions.
@@ -272,44 +503,98 @@ func (r *Runtime) Register(snapshot *registry.Snapshot) error {
 	if len(current) != 0 {
 		incoming := snapshot.Environments()
 		if len(current) != 1 || len(r.registry.Services()) != 0 || len(snapshot.Services()) == 0 || len(incoming) != 1 || current[0].ID != incoming[0].ID || current[0].SSHHost != incoming[0].SSHHost || current[0].Jinushi.StateDir != incoming[0].Jinushi.StateDir || !equalArgv(current[0].Jinushi.SupervisorStartCommand, incoming[0].Jinushi.SupervisorStartCommand) {
+			r.mu.Unlock()
 			return &Failure{Code: "lifecycle-conflict"}
 		}
 	}
 	if r.store == nil {
+		r.mu.Unlock()
 		return &Failure{Code: "registration-unavailable"}
 	}
-	// Prepare clients and observer before committing the persistent state.
-	candidate := &Runtime{ssh: r.ssh, tunnels: r.tunnels, httpClient: r.httpClient}
+	store, sshClient, tunnels, httpClient := r.store, r.ssh, r.tunnels, r.httpClient
+	baseVersion := r.configVersion
+	r.mu.Unlock()
+	// Validate the new observer before committing persistent state. Its closures
+	// capture the candidate maps and bind to the live Runtime's operation gates.
+	candidate := &Runtime{ssh: sshClient, tunnels: tunnels, httpClient: httpClient}
 	if err := candidate.configure(snapshot); err != nil {
 		return &Failure{Code: "invalid-request"}
 	}
-	if err := r.store.Save(snapshot); err != nil {
+	if err := opCtx.Err(); err != nil {
+		return classify(err)
+	}
+	if err := store.Save(snapshot); err != nil {
 		return err
 	}
 	// Rebind probe closures to the live runtime, not the temporary candidate.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.configVersion != baseVersion {
+		return &Failure{Code: "lifecycle-conflict"}
+	}
 	return r.configure(snapshot)
 }
 
 // EnsureJinushi is an explicit bootstrap-capable operation; background polls
 // only use the observation-only client.
 func (r *Runtime) EnsureJinushi(ctx context.Context, env string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
+	opCtx, finish, err := r.beginOperation(ctx)
+	if err != nil {
 		return &Failure{Code: "lifecycle-conflict"}
 	}
+	defer finish()
+
+	r.mu.Lock()
 	b, ok := r.bindings[env]
 	if !ok {
+		r.mu.Unlock()
 		return &Failure{Code: "unknown-identity"}
 	}
-	if err := b.control.EnsureReady(ctx); err != nil {
-		r.jinushi[env] = "unavailable"
+	configVersion := r.configVersion
+	gate := r.environmentGateLocked(env)
+	cancelPoll := r.invalidatePollLocked()
+	r.mu.Unlock()
+	if cancelPoll != nil {
+		cancelPoll()
+	}
+	release, err := acquireGate(opCtx, gate)
+	if err != nil {
 		return classify(err)
 	}
-	r.jinushi[env] = "ready"
+	defer release()
+	r.mu.Lock()
+	if r.closed || r.configVersion != configVersion || opCtx.Err() != nil {
+		r.mu.Unlock()
+		if err := opCtx.Err(); err != nil {
+			return classify(err)
+		}
+		return &Failure{Code: "lifecycle-conflict"}
+	}
+	r.mu.Unlock()
+
+	err = b.control.EnsureReady(opCtx)
+	r.mu.Lock()
+	var cancelAfterPublish context.CancelFunc
+	if !r.closed && r.configVersion == configVersion {
+		if _, stillRegistered := r.bindings[env]; stillRegistered {
+			if err != nil {
+				r.jinushi[env] = "unavailable"
+			} else {
+				r.jinushi[env] = "ready"
+			}
+			cancelAfterPublish = r.invalidatePollLocked()
+		}
+	}
+	r.mu.Unlock()
+	if cancelAfterPublish != nil {
+		cancelAfterPublish()
+	}
+	if err != nil {
+		return classify(err)
+	}
 	return nil
 }
-func (r *Runtime) service(env, id string) (registry.Service, error) {
+func (r *Runtime) serviceLocked(env, id string) (registry.Service, error) {
 	s, ok := r.services[key(env, id)]
 	if !ok {
 		return s, &Failure{Code: "unknown-identity"}
@@ -326,15 +611,12 @@ func (r *Runtime) Restart(ctx context.Context, env, id string) (Service, error) 
 	return r.mutate(ctx, env, id, "restart")
 }
 
-// updateDesiredState persists and publishes one lifecycle intent while the
-// runtime mutex is held. The observer is left intact because its probe targets
-// and runtime observations do not change when desired state changes.
-func (r *Runtime) updateDesiredState(s registry.Service, desired registry.DesiredState) (registry.Service, error) {
+func desiredStateCandidate(snapshot *registry.Snapshot, s registry.Service, desired registry.DesiredState) (*registry.Snapshot, registry.Service, error) {
 	if s.DesiredState == desired {
-		return s, nil
+		return snapshot, s, nil
 	}
 
-	services := r.registry.Services()
+	services := snapshot.Services()
 	found := false
 	for i := range services {
 		if services[i].EnvironmentID == s.EnvironmentID && services[i].ID == s.ID {
@@ -344,12 +626,12 @@ func (r *Runtime) updateDesiredState(s registry.Service, desired registry.Desire
 		}
 	}
 	if !found {
-		return registry.Service{}, &Failure{Code: "lifecycle-conflict"}
+		return nil, registry.Service{}, &Failure{Code: "lifecycle-conflict"}
 	}
 
-	candidate, err := registry.NewSnapshot(r.registry.Environments(), services)
+	candidate, err := registry.NewSnapshot(snapshot.Environments(), services)
 	if err != nil {
-		return registry.Service{}, &Failure{Code: "lifecycle-conflict"}
+		return nil, registry.Service{}, &Failure{Code: "lifecycle-conflict"}
 	}
 	var updated registry.Service
 	for _, service := range candidate.Services() {
@@ -359,56 +641,90 @@ func (r *Runtime) updateDesiredState(s registry.Service, desired registry.Desire
 		}
 	}
 	if updated.ID == "" {
-		return registry.Service{}, &Failure{Code: "lifecycle-conflict"}
+		return nil, registry.Service{}, &Failure{Code: "lifecycle-conflict"}
 	}
-	if r.store != nil {
-		if err := r.store.Save(candidate); err != nil {
-			return registry.Service{}, &Failure{Code: "lifecycle-conflict", Evidence: "desired service state could not be saved after the Jinushi operation succeeded"}
-		}
-	}
-
-	r.registry = candidate
-	r.services[key(string(updated.EnvironmentID), string(updated.ID))] = updated
-	return updated, nil
+	return candidate, updated, nil
 }
 
 func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	s, err := r.service(env, id)
+	opCtx, finish, err := r.beginOperation(ctx)
 	if err != nil {
+		return Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	defer finish()
+
+	pendingKey := key(env, id)
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	if _, err := r.serviceLocked(env, id); err != nil {
+		r.mu.Unlock()
 		return Service{}, err
 	}
-	if r.closed {
+	gate := r.serviceGateLocked(pendingKey)
+	cancelPoll := r.invalidatePollLocked()
+	r.mu.Unlock()
+	if cancelPoll != nil {
+		cancelPoll()
+	}
+	release, err := acquireGate(opCtx, gate)
+	if err != nil {
+		return Service{}, classify(err)
+	}
+	defer release()
+
+	r.mu.Lock()
+	if r.closed || opCtx.Err() != nil {
+		r.mu.Unlock()
+		if err := opCtx.Err(); err != nil {
+			return Service{}, classify(err)
+		}
 		return Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	s, err := r.serviceLocked(env, id)
+	if err != nil {
+		r.mu.Unlock()
+		return Service{}, err
 	}
 	owner := s.CorrelationOwner()
 	b := r.bindings[env]
-	pendingKey := key(env, id)
+	configVersion := r.configVersion
 	pending := r.pending[pendingKey]
 	if action != "stop" && pending.submissionID == "" {
 		var token string
 		token, err = jinushi.NewSubmissionID()
 		if err != nil {
+			r.mu.Unlock()
 			return Service{}, classify(err)
 		}
 		pending.submissionID = token
 		r.pending[pendingKey] = pending
 	}
+	if r.serviceVersions == nil {
+		r.serviceVersions = map[string]uint64{}
+	}
+	r.serviceVersions[pendingKey]++
+	serviceVersion := r.serviceVersions[pendingKey]
+	inputs := r.captureInputsLocked()
+	r.mu.Unlock()
+
 	var run jinushi.Run
 	var observedRun *jinushi.Run
 	switch action {
 	case "start":
-		run, err = b.control.Start(ctx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: pending.submissionID})
+		run, err = b.control.Start(opCtx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: pending.submissionID})
 		observedRun = &run
 	case "restart":
-		run, err = b.control.RestartWithAttempt(ctx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: pending.submissionID}, &pending.restart)
+		run, err = b.control.RestartWithAttempt(opCtx, jinushi.StartRequest{Service: jinushi.Service{ID: owner, Argv: s.Execution.Argv, Cwd: s.Execution.CWD}, SubmissionID: pending.submissionID}, &pending.restart)
 		observedRun = &run
 	case "stop":
 		var status jinushi.ServiceStatus
-		status, err = b.control.Stop(ctx, owner)
+		status, err = b.control.Stop(opCtx, owner)
 		observedRun = status.Run
 	}
+	r.mu.Lock()
 	if action != "stop" {
 		r.pending[pendingKey] = pending
 	}
@@ -417,44 +733,124 @@ func (r *Runtime) mutate(ctx context.Context, env, id, action string) (Service, 
 		if action != "stop" && errors.As(err, &failure) && (failure.Kind == jinushi.KindInvalid || failure.Kind == jinushi.KindCommand || failure.Kind == jinushi.KindBootstrapFailed) {
 			delete(r.pending, pendingKey)
 		}
+		r.mu.Unlock()
 		return Service{}, classify(err)
 	}
 	if action != "stop" {
 		if _, stateErr := processState(run); stateErr != nil {
+			r.mu.Unlock()
 			return Service{}, &Failure{Code: "lifecycle-conflict"}
 		}
 	}
 	if action == "stop" || run.ID != "" {
 		delete(r.pending, pendingKey)
 	}
+	if r.closed || r.configVersion != configVersion {
+		r.mu.Unlock()
+		return Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	r.mu.Unlock()
+
 	desired := registry.DesiredRunning
 	if action == "stop" {
 		desired = registry.DesiredStopped
 	}
-	s, err = r.updateDesiredState(s, desired)
+	r.registryMu.Lock()
+	r.mu.Lock()
+	if r.closed || r.configVersion != configVersion {
+		r.mu.Unlock()
+		r.registryMu.Unlock()
+		return Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	s, err = r.serviceLocked(env, id)
 	if err != nil {
+		r.mu.Unlock()
+		r.registryMu.Unlock()
 		return Service{}, err
 	}
+	candidate, s, err := desiredStateCandidate(r.registry, s, desired)
+	store := r.store
+	r.mu.Unlock()
+	if err == nil && store != nil {
+		err = store.Save(candidate)
+		if err != nil {
+			err = &Failure{Code: "lifecycle-conflict", Evidence: "desired service state could not be saved after the Jinushi operation succeeded"}
+		}
+	}
+	if err != nil {
+		r.registryMu.Unlock()
+		return Service{}, err
+	}
+	r.mu.Lock()
+	if r.closed || r.configVersion != configVersion {
+		r.mu.Unlock()
+		r.registryMu.Unlock()
+		return Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	r.registry = candidate
+	r.services[pendingKey] = s
 	r.jinushi[env] = "ready"
+	cancelAfterPublish := r.invalidatePollLocked()
+	r.mu.Unlock()
+	if cancelAfterPublish != nil {
+		cancelAfterPublish()
+	}
+	r.registryMu.Unlock()
+
 	if action == "stop" {
 		for _, ep := range s.Endpoints {
 			identity := tunnel.Identity{Environment: env, Service: id, Endpoint: string(ep.ID)}
-			if _, getErr := r.tunnels.Get(identity); getErr == nil {
-				if _, stopErr := r.tunnels.Stop(ctx, identity); stopErr != nil {
+			if _, getErr := inputs.tunnels.Get(identity); getErr == nil {
+				if _, stopErr := inputs.tunnels.Stop(opCtx, identity); stopErr != nil {
 					continue
 				}
 			}
-			delete(r.endpointFailures, identity)
+			delete(inputs.endpointFailures, identity)
 		}
 	} else {
-		r.ensureHealth(ctx, s)
+		r.ensureHealth(opCtx, s, &inputs)
 	}
-	observation := r.actionObservation(ctx, s, action, observedRun)
+	r.mu.Lock()
+	if !r.closed && r.configVersion == configVersion && r.serviceVersions[pendingKey] == serviceVersion {
+		for _, endpoint := range s.Endpoints {
+			identity := tunnel.Identity{Environment: env, Service: id, Endpoint: string(endpoint.ID)}
+			if failure, ok := inputs.endpointFailures[identity]; ok {
+				r.endpointFailures[identity] = failure
+			} else {
+				delete(r.endpointFailures, identity)
+			}
+		}
+	}
+	cancelAfterPublish = r.invalidatePollLocked()
+	r.mu.Unlock()
+	if cancelAfterPublish != nil {
+		cancelAfterPublish()
+	}
+
+	observation := r.actionObservation(opCtx, s, action, observedRun, inputs)
+	r.mu.Lock()
+	if r.closed || r.configVersion != configVersion {
+		r.mu.Unlock()
+		return Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	if r.serviceVersions[pendingKey] != serviceVersion {
+		r.mu.Unlock()
+		return Service{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	if err := opCtx.Err(); err != nil {
+		r.mu.Unlock()
+		return Service{}, classify(err)
+	}
 	r.observer.PublishServiceObservation(env, observation)
+	cancelAfterPublish = r.invalidatePollLocked()
+	r.mu.Unlock()
+	if cancelAfterPublish != nil {
+		cancelAfterPublish()
+	}
 	return r.serviceView(s, observation), nil
 }
 
-func (r *Runtime) actionObservation(ctx context.Context, s registry.Service, action string, run *jinushi.Run) health.ServiceObservation {
+func (r *Runtime) actionObservation(ctx context.Context, s registry.Service, action string, run *jinushi.Run, inputs probeInputs) health.ServiceObservation {
 	observation := health.ServiceObservation{ID: string(s.ID), Process: health.ProcessUnknown, Readiness: health.ReadinessUnknown}
 	if run != nil {
 		var err error
@@ -465,7 +861,7 @@ func (r *Runtime) actionObservation(ctx context.Context, s registry.Service, act
 	}
 	if action != "stop" {
 		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-		readiness, err := r.readiness(probeCtx, string(s.EnvironmentID), string(s.ID))
+		readiness, err := r.readinessWith(probeCtx, inputs, string(s.EnvironmentID), string(s.ID))
 		cancel()
 		observation.Readiness = readiness
 		if ctx.Err() != nil {
@@ -477,7 +873,7 @@ func (r *Runtime) actionObservation(ctx context.Context, s registry.Service, act
 	observation.State = health.AggregateServiceState(observation.Process, observation.Readiness)
 	observation.Endpoints = make([]health.EndpointObservation, 0, len(s.Endpoints))
 	for _, endpoint := range s.Endpoints {
-		state, err := r.endpointState(ctx, string(s.EnvironmentID), string(s.ID), string(endpoint.ID))
+		state, err := r.endpointStateWith(ctx, inputs, string(s.EnvironmentID), string(s.ID), string(endpoint.ID))
 		message := ""
 		if err != nil {
 			message = err.Error()
@@ -487,80 +883,165 @@ func (r *Runtime) actionObservation(ctx context.Context, s registry.Service, act
 	return observation
 }
 
-func (r *Runtime) ensureHealth(ctx context.Context, s registry.Service) {
+func (r *Runtime) ensureHealth(ctx context.Context, s registry.Service, inputs *probeInputs) {
 	for _, ep := range s.Endpoints {
 		if ep.ID == s.Health.EndpointID {
-			_, _ = r.ensure(ctx, s, ep)
+			_, _ = r.ensure(ctx, s, ep, inputs)
 			return
 		}
 	}
 }
-func (r *Runtime) ensure(ctx context.Context, s registry.Service, ep registry.Endpoint) (tunnel.Snapshot, error) {
+func (r *Runtime) ensure(ctx context.Context, s registry.Service, ep registry.Endpoint, inputs *probeInputs) (tunnel.Snapshot, error) {
 	identity := tunnel.Identity{Environment: string(s.EnvironmentID), Service: string(s.ID), Endpoint: string(ep.ID)}
-	port, err := r.resolveEndpoint(ctx, s, ep)
+	if err := ctx.Err(); err != nil {
+		return tunnel.Snapshot{}, err
+	}
+	b, exists := inputs.bindings[string(s.EnvironmentID)]
+	if !exists {
+		return tunnel.Snapshot{}, errors.New(endpointEvidenceMissing)
+	}
+	port, err := resolveEndpoint(ctx, inputs.ssh, b, s, ep)
 	if err != nil {
-		if current, getErr := r.tunnels.Get(identity); getErr == nil && (current.State == tunnel.StateReady || current.State == tunnel.StateStarting) {
-			if _, stopErr := r.tunnels.Stop(ctx, identity); stopErr != nil {
+		if ctx.Err() != nil {
+			return tunnel.Snapshot{}, ctx.Err()
+		}
+		if current, getErr := inputs.tunnels.Get(identity); getErr == nil && (current.State == tunnel.StateReady || current.State == tunnel.StateStarting) {
+			if _, stopErr := inputs.tunnels.Stop(ctx, identity); stopErr != nil {
 				err = errors.New(endpointEvidenceStale)
 			}
 		}
-		r.endpointFailures[identity] = err.Error()
+		inputs.endpointFailures[identity] = err.Error()
 		return tunnel.Snapshot{}, err
 	}
-	delete(r.endpointFailures, identity)
-	if current, getErr := r.tunnels.Get(identity); getErr == nil {
+	if err := ctx.Err(); err != nil {
+		return tunnel.Snapshot{}, err
+	}
+	delete(inputs.endpointFailures, identity)
+	if current, getErr := inputs.tunnels.Get(identity); getErr == nil {
 		if (current.State == tunnel.StateReady || current.State == tunnel.StateStarting) && current.RemotePort == port {
 			return current, nil
 		}
 		if current.State == tunnel.StateReady || current.State == tunnel.StateStarting {
-			if _, stopErr := r.tunnels.Stop(ctx, identity); stopErr != nil {
+			if _, stopErr := inputs.tunnels.Stop(ctx, identity); stopErr != nil {
 				failure := errors.New(endpointEvidenceStale)
-				r.endpointFailures[identity] = failure.Error()
+				inputs.endpointFailures[identity] = failure.Error()
 				return current, failure
 			}
 		}
 	}
-	snapshot, err := r.tunnels.Start(ctx, tunnel.Request{Identity: identity, SSHHost: r.bindings[string(s.EnvironmentID)].environment.SSHHost, RemotePort: port})
+	snapshot, err := inputs.tunnels.Start(ctx, tunnel.Request{Identity: identity, SSHHost: b.environment.SSHHost, RemotePort: port})
 	if err != nil {
-		r.endpointFailures[identity] = "The SSH tunnel to the registered endpoint could not be established."
+		inputs.endpointFailures[identity] = "The SSH tunnel to the registered endpoint could not be established."
 		return snapshot, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+		_, cleanupErr := inputs.tunnels.Stop(cleanupCtx, identity)
+		cancel()
+		if cleanupErr != nil {
+			return snapshot, errors.Join(ctxErr, fmt.Errorf("stop tunnel started after cancellation: %w", cleanupErr))
+		}
+		return snapshot, ctxErr
 	}
 	return snapshot, nil
 }
 func (r *Runtime) Ensure(ctx context.Context, env, id, endpoint string) (Endpoint, error) {
+	opCtx, finish, err := r.beginOperation(ctx)
+	if err != nil {
+		return Endpoint{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	defer finish()
+	pendingKey := key(env, id)
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	s, err := r.service(env, id)
+	s, err := r.serviceLocked(env, id)
+	if err != nil {
+		r.mu.Unlock()
+		return Endpoint{}, err
+	}
+	gate := r.serviceGateLocked(pendingKey)
+	configVersion := r.configVersion
+	inputs := r.captureInputsLocked()
+	cancelPoll := r.invalidatePollLocked()
+	r.mu.Unlock()
+	if cancelPoll != nil {
+		cancelPoll()
+	}
+	release, err := acquireGate(opCtx, gate)
+	if err != nil {
+		return Endpoint{}, classify(err)
+	}
+	defer release()
+	r.mu.Lock()
+	if r.closed || r.configVersion != configVersion || opCtx.Err() != nil {
+		r.mu.Unlock()
+		if err := opCtx.Err(); err != nil {
+			return Endpoint{}, classify(err)
+		}
+		return Endpoint{}, &Failure{Code: "lifecycle-conflict"}
+	}
+	s, err = r.serviceLocked(env, id)
+	inputs = r.captureInputsLocked()
+	r.mu.Unlock()
 	if err != nil {
 		return Endpoint{}, err
 	}
-	if r.closed {
-		return Endpoint{}, &Failure{Code: "lifecycle-conflict"}
-	}
 	for _, ep := range s.Endpoints {
 		if string(ep.ID) == endpoint {
-			snap, err := r.ensure(ctx, s, ep)
+			identity := tunnel.Identity{Environment: env, Service: id, Endpoint: endpoint}
+			snap, err := r.ensure(opCtx, s, ep, &inputs)
 			if err != nil {
-				identity := tunnel.Identity{Environment: env, Service: id, Endpoint: endpoint}
-				evidence := r.endpointFailures[identity]
+				if opCtx.Err() != nil {
+					return Endpoint{}, classify(opCtx.Err())
+				}
+				evidence := inputs.endpointFailures[identity]
 				if evidence == "" {
 					evidence = "The SSH tunnel to the registered endpoint could not be established."
+				}
+				r.mu.Lock()
+				var cancelAfterPublish context.CancelFunc
+				if !r.closed && r.configVersion == configVersion {
+					r.endpointFailures[identity] = evidence
+					cancelAfterPublish = r.invalidatePollLocked()
+				}
+				r.mu.Unlock()
+				if cancelAfterPublish != nil {
+					cancelAfterPublish()
 				}
 				failure := &Failure{Code: "endpoint-unavailable", Evidence: bounded(evidence)}
 				return Endpoint{}, failure
 			}
-			state, probeErr := r.endpointState(ctx, env, id, endpoint)
+			state, probeErr := r.endpointStateWith(opCtx, inputs, env, id, endpoint)
 			observation := health.EndpointObservation{State: state}
 			if probeErr != nil {
 				observation.Error = probeErr.Error()
 			}
-			return r.endpointView(s, ep, observation, snap), nil
+			r.mu.Lock()
+			current, currentErr := r.serviceLocked(env, id)
+			if r.closed || r.configVersion != configVersion || currentErr != nil {
+				r.mu.Unlock()
+				return Endpoint{}, &Failure{Code: "lifecycle-conflict"}
+			}
+			if failure := inputs.endpointFailures[identity]; failure == "" {
+				delete(r.endpointFailures, identity)
+			} else {
+				r.endpointFailures[identity] = failure
+			}
+			cancelAfterPublish := r.invalidatePollLocked()
+			r.mu.Unlock()
+			if cancelAfterPublish != nil {
+				cancelAfterPublish()
+			}
+			return r.endpointView(current, ep, observation, snap), nil
 		}
 	}
 	return Endpoint{}, &Failure{Code: "unknown-identity"}
 }
-func (r *Runtime) connectivity(ctx context.Context, env string) (health.ConnectivityState, error) {
-	_, err := r.ssh.Run(ctx, r.bindings[env].environment.SSHHost, []string{"true"}, probeTimeout)
+func (r *Runtime) connectivityWith(ctx context.Context, inputs probeInputs, env string) (health.ConnectivityState, error) {
+	b, exists := inputs.bindings[env]
+	if !exists {
+		return health.ConnectivityUnknown, errors.New("unknown environment")
+	}
+	_, err := inputs.ssh.Run(ctx, b.environment.SSHHost, []string{"true"}, probeTimeout)
 	if err == nil {
 		return health.ConnectivityConnected, nil
 	}
@@ -570,9 +1051,19 @@ func (r *Runtime) connectivity(ctx context.Context, env string) (health.Connecti
 	}
 	return health.ConnectivityError, err
 }
-func (r *Runtime) process(ctx context.Context, env, id string) (health.ProcessState, error) {
-	s := r.services[key(env, id)]
-	status, err := r.bindings[env].observe.Status(ctx, s.CorrelationOwner())
+func (r *Runtime) connectivity(ctx context.Context, env string) (health.ConnectivityState, error) {
+	r.mu.Lock()
+	inputs := r.captureInputsLocked()
+	r.mu.Unlock()
+	return r.connectivityWith(ctx, inputs, env)
+}
+func (r *Runtime) processWith(ctx context.Context, inputs probeInputs, env, id string) (health.ProcessState, error) {
+	s, exists := inputs.services[key(env, id)]
+	b, bindingExists := inputs.bindings[env]
+	if !exists || !bindingExists {
+		return health.ProcessUnknown, errors.New("unknown service")
+	}
+	status, err := b.observe.Status(ctx, s.CorrelationOwner())
 	if err != nil {
 		return health.ProcessUnknown, err
 	}
@@ -580,6 +1071,12 @@ func (r *Runtime) process(ctx context.Context, env, id string) (health.ProcessSt
 		return health.ProcessUnknown, nil
 	}
 	return processState(*status.Run)
+}
+func (r *Runtime) process(ctx context.Context, env, id string) (health.ProcessState, error) {
+	r.mu.Lock()
+	inputs := r.captureInputsLocked()
+	r.mu.Unlock()
+	return r.processWith(ctx, inputs, env, id)
 }
 
 func processState(run jinushi.Run) (health.ProcessState, error) {
@@ -594,13 +1091,16 @@ func processState(run jinushi.Run) (health.ProcessState, error) {
 		return health.ProcessUnknown, fmt.Errorf("Jinushi state uncertain")
 	}
 }
-func (r *Runtime) readiness(ctx context.Context, env, id string) (health.ReadinessState, error) {
-	s := r.services[key(env, id)]
+func (r *Runtime) readinessWith(ctx context.Context, inputs probeInputs, env, id string) (health.ReadinessState, error) {
+	s, exists := inputs.services[key(env, id)]
+	if !exists {
+		return health.ReadinessUnknown, errors.New("unknown service")
+	}
 	identity := tunnel.Identity{Environment: env, Service: id, Endpoint: string(s.Health.EndpointID)}
-	if failure := r.endpointFailures[identity]; strings.HasPrefix(failure, "Dynamic endpoint") {
+	if failure := inputs.endpointFailures[identity]; strings.HasPrefix(failure, "Dynamic endpoint") {
 		return health.ReadinessError, errors.New(failure)
 	}
-	snap, err := r.tunnels.Get(identity)
+	snap, err := inputs.tunnels.Get(identity)
 	if err != nil {
 		return health.ReadinessUnknown, nil
 	}
@@ -621,7 +1121,7 @@ func (r *Runtime) readiness(ctx context.Context, env, id string) (health.Readine
 	if err != nil {
 		return health.ReadinessError, err
 	}
-	resp, err := r.httpClient.Do(req)
+	resp, err := inputs.httpClient.Do(req)
 	if err != nil {
 		return health.ReadinessNotReady, nil
 	}
@@ -633,18 +1133,24 @@ func (r *Runtime) readiness(ctx context.Context, env, id string) (health.Readine
 	}
 	return health.ReadinessUnhealthy, nil
 }
-func (r *Runtime) endpointState(ctx context.Context, env, id, ep string) (health.EndpointState, error) {
+func (r *Runtime) readiness(ctx context.Context, env, id string) (health.ReadinessState, error) {
+	r.mu.Lock()
+	inputs := r.captureInputsLocked()
+	r.mu.Unlock()
+	return r.readinessWith(ctx, inputs, env, id)
+}
+func (r *Runtime) endpointStateWith(ctx context.Context, inputs probeInputs, env, id, ep string) (health.EndpointState, error) {
 	identity := tunnel.Identity{Environment: env, Service: id, Endpoint: ep}
-	if failure := r.endpointFailures[identity]; failure != "" {
+	if failure := inputs.endpointFailures[identity]; failure != "" {
 		return health.EndpointError, errors.New(failure)
 	}
-	snap, err := r.tunnels.Get(identity)
+	snap, err := inputs.tunnels.Get(identity)
 	if err != nil {
 		return health.EndpointUnavailable, nil
 	}
 	switch snap.State {
 	case tunnel.StateReady:
-		if err := r.probeApplicationEndpoint(ctx, snap.LocalURL); err != nil {
+		if err := probeApplicationEndpoint(ctx, inputs.httpClient, snap.LocalURL); err != nil {
 			return health.EndpointUnavailable, err
 		}
 		return health.EndpointAvailable, nil
@@ -657,14 +1163,21 @@ func (r *Runtime) endpointState(ctx context.Context, env, id, ep string) (health
 	}
 }
 
-func (r *Runtime) probeApplicationEndpoint(ctx context.Context, localURL string) error {
+func (r *Runtime) endpointState(ctx context.Context, env, id, ep string) (health.EndpointState, error) {
+	r.mu.Lock()
+	inputs := r.captureInputsLocked()
+	r.mu.Unlock()
+	return r.endpointStateWith(ctx, inputs, env, id, ep)
+}
+
+func probeApplicationEndpoint(ctx context.Context, client *http.Client, localURL string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, localURL, nil)
 	if err != nil {
 		return errors.New(endpointApplicationDown)
 	}
-	response, err := r.httpClient.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		return errors.New(endpointApplicationDown)
 	}
@@ -672,41 +1185,130 @@ func (r *Runtime) probeApplicationEndpoint(ctx context.Context, localURL string)
 	return nil
 }
 func (r *Runtime) Poll(ctx context.Context) error {
+	opCtx, finish, err := r.beginOperation(ctx)
+	if err != nil {
+		return errRuntimeClosed
+	}
+	defer finish()
+	select {
+	case r.pollGate <- struct{}{}:
+		defer func() { <-r.pollGate }()
+	case <-opCtx.Done():
+		return opCtx.Err()
+	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return errors.New("runtime closed")
+		return errRuntimeClosed
 	}
-	for _, s := range r.registry.Services() {
-		if s.DesiredState == registry.DesiredRunning {
-			r.ensureHealth(ctx, s)
+	pollCtx, cancel := context.WithCancel(opCtx)
+	r.pollCancel = cancel
+	pollVersion := r.pollVersion
+	configVersion := r.configVersion
+	registrySnapshot := r.registry
+	inputs := r.captureInputsLocked()
+	r.mu.Unlock()
+	defer func() {
+		cancel()
+		r.mu.Lock()
+		r.pollCancel = nil
+		r.mu.Unlock()
+	}()
+	internalCancellation := func(err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		for _, endpoint := range s.Endpoints {
-			if endpoint.Resolution == nil || (endpoint.ID == s.Health.EndpointID && s.DesiredState == registry.DesiredRunning) {
-				continue
-			}
-			identity := tunnel.Identity{Environment: string(s.EnvironmentID), Service: string(s.ID), Endpoint: string(endpoint.ID)}
-			current, err := r.tunnels.Get(identity)
-			if (err == nil && (current.State == tunnel.StateReady || current.State == tunnel.StateStarting)) || r.endpointFailures[identity] != "" {
-				_, _ = r.ensure(ctx, s, endpoint)
-			}
+		r.mu.Lock()
+		closed := r.closed
+		r.mu.Unlock()
+		if closed {
+			return errRuntimeClosed
 		}
-	}
-	defer r.mu.Unlock()
-	if err := r.observer.Poll(ctx); err != nil {
+		if pollCtx.Err() != nil {
+			return nil
+		}
 		return err
 	}
-	for _, env := range r.observer.Snapshot().Environments {
-		if env.State != health.ConnectivityConnected {
-			r.jinushi[env.ID] = "unknown"
-			continue
+	for _, service := range registrySnapshot.Services() {
+		if err := pollCtx.Err(); err != nil {
+			return internalCancellation(err)
 		}
-		if err := r.bindings[env.ID].observe.EnsureReady(ctx); err != nil {
-			r.jinushi[env.ID] = "unavailable"
-		} else {
-			r.jinushi[env.ID] = "ready"
+		serviceKey := key(string(service.EnvironmentID), string(service.ID))
+		if service.DesiredState == registry.DesiredRunning {
+			release, gateErr := r.acquireServiceGate(pollCtx, serviceKey)
+			if gateErr != nil {
+				return internalCancellation(gateErr)
+			}
+			r.ensureHealth(pollCtx, service, &inputs)
+			release()
+		}
+		for _, endpoint := range service.Endpoints {
+			if endpoint.Resolution == nil || (endpoint.ID == service.Health.EndpointID && service.DesiredState == registry.DesiredRunning) {
+				continue
+			}
+			identity := tunnel.Identity{Environment: string(service.EnvironmentID), Service: string(service.ID), Endpoint: string(endpoint.ID)}
+			current, getErr := inputs.tunnels.Get(identity)
+			if !((getErr == nil && (current.State == tunnel.StateReady || current.State == tunnel.StateStarting)) || inputs.endpointFailures[identity] != "") {
+				continue
+			}
+			release, gateErr := r.acquireServiceGate(pollCtx, serviceKey)
+			if gateErr != nil {
+				return internalCancellation(gateErr)
+			}
+			_, _ = r.ensure(pollCtx, service, endpoint, &inputs)
+			release()
 		}
 	}
+	candidate, err := r.newObserver(registrySnapshot, inputs)
+	if err != nil {
+		return err
+	}
+	if err := candidate.Poll(pollCtx); err != nil {
+		return internalCancellation(err)
+	}
+	statuses := make(map[string]string)
+	for _, environment := range candidate.Snapshot().Environments {
+		if environment.State != health.ConnectivityConnected {
+			statuses[environment.ID] = "unknown"
+			continue
+		}
+		binding, exists := inputs.bindings[environment.ID]
+		if !exists {
+			statuses[environment.ID] = "unavailable"
+			continue
+		}
+		release, gateErr := r.acquireEnvironmentGate(pollCtx, environment.ID)
+		if gateErr != nil {
+			return internalCancellation(gateErr)
+		}
+		readyErr := binding.observe.EnsureReady(pollCtx)
+		release()
+		if readyErr != nil {
+			statuses[environment.ID] = "unavailable"
+		} else {
+			statuses[environment.ID] = "ready"
+		}
+	}
+	if err := pollCtx.Err(); err != nil {
+		return internalCancellation(err)
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return errRuntimeClosed
+	}
+	if pollVersion != r.pollVersion || configVersion != r.configVersion {
+		r.mu.Unlock()
+		return internalCancellation(context.Canceled)
+	}
+	if err := ctx.Err(); err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	r.observer = candidate
+	r.jinushi = statuses
+	r.endpointFailures = inputs.endpointFailures
+	r.mu.Unlock()
 	return nil
 }
 func (r *Runtime) Run(ctx context.Context) error {
@@ -728,9 +1330,27 @@ func (r *Runtime) Run(ctx context.Context) error {
 }
 func (r *Runtime) Close(ctx context.Context) error {
 	r.mu.Lock()
-	r.closed = true
+	if !r.closed {
+		r.closed = true
+		r.pollVersion++
+	}
+	cancelPoll := r.pollCancel
+	shutdownCancel := r.shutdownCancel
+	activeDone := r.activeDone
 	r.mu.Unlock()
-	return r.tunnels.Close(ctx)
+	if cancelPoll != nil {
+		cancelPoll()
+	}
+	if shutdownCancel != nil {
+		shutdownCancel()
+	}
+	var waitErr error
+	select {
+	case <-activeDone:
+	case <-ctx.Done():
+		waitErr = ctx.Err()
+	}
+	return errors.Join(waitErr, r.tunnels.Close(ctx))
 }
 
 type State struct {
@@ -822,12 +1442,19 @@ func (r *Runtime) serviceView(s registry.Service, obs health.ServiceObservation)
 }
 func (r *Runtime) Snapshot() State {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	observed := r.observer.Snapshot()
+	registrySnapshot := r.registry
+	observer := r.observer
+	services := cloneServices(r.services)
+	jinushi := make(map[string]string, len(r.jinushi))
+	for id, status := range r.jinushi {
+		jinushi[id] = status
+	}
+	r.mu.Unlock()
+	observed := observer.Snapshot()
 	result := State{Version: 1, Environments: []Environment{}}
-	for _, e := range r.registry.Environments() {
+	for _, e := range registrySnapshot.Environments() {
 		view := Environment{ID: string(e.ID), SSHHost: e.SSHHost, Connectivity: health.ConnectivityUnknown, Jinushi: "unknown", Services: []Service{}}
-		if status := r.jinushi[view.ID]; status != "" {
+		if status := jinushi[view.ID]; status != "" {
 			view.Jinushi = status
 		}
 		for _, o := range observed.Environments {
@@ -835,13 +1462,13 @@ func (r *Runtime) Snapshot() State {
 				view.Connectivity = o.State
 				view.Error = observationError(o.Error)
 				for _, so := range o.Services {
-					view.Services = append(view.Services, r.serviceView(r.services[key(view.ID, so.ID)], so))
+					view.Services = append(view.Services, r.serviceView(services[key(view.ID, so.ID)], so))
 				}
 				break
 			}
 		}
 		if len(view.Services) == 0 {
-			for _, s := range r.registry.Services() {
+			for _, s := range registrySnapshot.Services() {
 				if s.EnvironmentID == e.ID {
 					view.Services = append(view.Services, r.serviceView(s, health.ServiceObservation{}))
 				}
