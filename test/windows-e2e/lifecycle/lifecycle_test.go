@@ -93,7 +93,9 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	}
 
 	assertOpenUnavailable(t, uiURL)
-	waiting := waitServiceProjection(t, apiURL, "unknown", "not-ready")
+	// A failed or absent health forward supplies no application probe result;
+	// the unowned Run cannot establish process or readiness evidence.
+	waiting := waitServiceProjection(t, apiURL, "unknown", "unknown")
 	assertNoLaunchInProgress(t, waiting)
 	if waiting.ProcessError != "" {
 		t.Fatalf("Jinushi process observation failed instead of classifying the unowned Run: %q", waiting.ProcessError)
