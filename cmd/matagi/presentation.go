@@ -593,10 +593,11 @@ func (p *desktopPresentation) reconcileEndpoints() {
 		return
 	}
 	state, err := p.client.GetState(p.ctx)
-	origins := make(map[presentation.EndpointKey]string)
-	if err == nil {
-		origins = p.endpointOrigins(state)
+	if err != nil {
+		// An observation failure is not evidence that the admitted origin changed.
+		return
 	}
+	origins := p.endpointOrigins(state)
 	for _, view := range p.model.Snapshot().Views {
 		if view.State != presentation.ViewCreated && view.State != presentation.ViewMoving {
 			continue
