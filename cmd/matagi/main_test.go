@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -70,6 +71,9 @@ func (p fakePlatform) Open(ctx context.Context, w desktop.Window) error { return
 func (fakePlatform) ReportError(string, string)                         {}
 
 func TestProductionComposition(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("the production Windows multiview path is exercised by the candidate workflow")
+	}
 	configDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configDir)
 	t.Setenv("APPDATA", configDir)
@@ -172,6 +176,9 @@ func TestProductionComposition(t *testing.T) {
 }
 
 func TestProductionFailureClosesRuntime(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("the production Windows multiview path is exercised by the candidate workflow")
+	}
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("APPDATA", t.TempDir())
 	rt := &fakeRuntime{fail: errors.New("runtime failed")}
