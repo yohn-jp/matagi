@@ -28,15 +28,17 @@ func TestCleanProfileOnboardsThroughExactCandidate(t *testing.T) {
 	if !strings.Contains(first, `<html lang="en">`) || !strings.Contains(first, "Connect a development environment") || strings.Contains(first, "<textarea") || strings.Contains(first, "registry JSON") {
 		t.Fatal("rejected first-run surface")
 	}
-	localeStart := strings.Index(first, `id="ui-locale"`)
+	// The integrated UI centralizes the JA/EN preference on the trusted Settings page.
+	settingsPage := harness.Get(t, uiURL+"/settings")
+	localeStart := strings.Index(settingsPage, `id="ui-locale"`)
 	if localeStart < 0 {
 		t.Fatal("first-run surface omitted the English/Japanese language selector")
 	}
-	localeEnd := strings.Index(first[localeStart:], `</select>`)
+	localeEnd := strings.Index(settingsPage[localeStart:], `</select>`)
 	if localeEnd < 0 {
 		t.Fatal("first-run language selector was malformed")
 	}
-	localeControl := first[localeStart : localeStart+localeEnd]
+	localeControl := settingsPage[localeStart : localeStart+localeEnd]
 	if strings.Count(localeControl, `<option`) != 2 || !strings.Contains(localeControl, `value="en"`) || !strings.Contains(localeControl, `value="ja"`) {
 		t.Fatalf("language selector must offer exactly en and ja: %s", localeControl)
 	}
