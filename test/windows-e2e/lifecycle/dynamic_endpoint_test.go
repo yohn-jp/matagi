@@ -62,7 +62,7 @@ func TestDynamicEndpointOpensTheExactManagedRunsEphemeralPort(t *testing.T) {
 	if started.State != "ready" {
 		t.Fatalf("dynamic service did not become ready against its managed endpoint: %#v", started)
 	}
-	localURL := openEndpoint(t, uiURL)
+	localURL := openEndpoint(t, apiURL, uiURL)
 	if body := harness.Get(t, localURL+"/"); body != "managed-instance" {
 		t.Fatalf("Open reached %q; want exact managed Run endpoint (unrelated listener was %d)", body, unrelatedPort)
 	}

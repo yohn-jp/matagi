@@ -93,7 +93,9 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	}
 
 	assertOpenUnavailable(t, uiURL)
-	waiting := waitServiceProjection(t, apiURL, "unknown", "not-ready")
+	// A failed or absent health forward supplies no application probe result;
+	// the unowned Run cannot establish process or readiness evidence.
+	waiting := waitServiceProjection(t, apiURL, "unknown", "unknown")
 	assertNoLaunchInProgress(t, waiting)
 	if waiting.ProcessError != "" {
 		t.Fatalf("Jinushi process observation failed instead of classifying the unowned Run: %q", waiting.ProcessError)
@@ -108,7 +110,7 @@ func TestLifecycleAndTunnelOwnershipThroughProductionCandidate(t *testing.T) {
 	if started.State != "ready" {
 		t.Fatalf("explicit Start did not converge to ready: %#v", started)
 	}
-	localURL := openEndpoint(t, uiURL)
+	localURL := openEndpoint(t, apiURL, uiURL)
 	if body := harness.Get(t, localURL+"/"); !strings.Contains(body, "fixture-ui") {
 		t.Fatalf("forwarded endpoint returned unexpected body %q", body)
 	}
@@ -186,7 +188,7 @@ func postAction(t *testing.T, uiURL, action string) {
 	}
 }
 
-func openEndpoint(t *testing.T, uiURL string) string {
+func openEndpoint(t *testing.T, apiURL, uiURL string) string {
 	t.Helper()
 	form := url.Values{
 		"token":         {formToken(t, uiURL)},
@@ -210,10 +212,93 @@ func openEndpoint(t *testing.T, uiURL string) string {
 		t.Fatalf("open endpoint: %s %s", resp.Status, body)
 	}
 	location := resp.Header.Get("Location")
-	if !strings.HasPrefix(location, "http://127.0.0.1:") {
-		t.Fatalf("non-loopback ensured endpoint %q", location)
+	parsed, err := url.Parse(location)
+	if err != nil || parsed.IsAbs() || parsed.Path != "/service" || parsed.Query().Get("environmentId") != "fixture-env" {
+		t.Fatalf("/open did not return to the trusted service surface: %q (%v)", location, err)
 	}
-	return strings.TrimRight(location, "/")
+	assertPresentationView(t, uiURL)
+	return ensuredEndpointURL(t, apiURL, "fixture-env", "fixture-service", "ui")
+}
+
+type presentationEndpointKey struct {
+	EnvironmentID string `json:"environmentId"`
+	ServiceID     string `json:"serviceId"`
+	EndpointID    string `json:"endpointId"`
+}
+
+type presentationViewProjection struct {
+	Key      presentationEndpointKey `json:"key"`
+	Location string                  `json:"location"`
+	State    string                  `json:"state"`
+}
+
+func assertPresentationView(t *testing.T, uiURL string) {
+	t.Helper()
+	var projection struct {
+		Views    []presentationViewProjection `json:"views"`
+		Selected *presentationEndpointKey     `json:"selected"`
+	}
+	if err := json.Unmarshal([]byte(harness.Get(t, uiURL+"/presentation")), &projection); err != nil {
+		t.Fatalf("decode /presentation: %v", err)
+	}
+	for _, view := range projection.Views {
+		if view.Key == (presentationEndpointKey{EnvironmentID: "fixture-env", ServiceID: "fixture-service", EndpointID: "ui"}) {
+			if view.Location != "tab" || view.State != "created" {
+				t.Fatalf("opened logical view = %#v, want created tab", view)
+			}
+			if projection.Selected == nil || *projection.Selected != view.Key {
+				t.Fatalf("opened logical view was not selected: %#v", projection.Selected)
+			}
+			return
+		}
+	}
+	t.Fatalf("/presentation omitted the opened logical endpoint: %#v", projection.Views)
+}
+
+func ensuredEndpointURL(t *testing.T, apiURL, environmentID, serviceID, endpointID string) string {
+	t.Helper()
+	var state struct {
+		Environments []struct {
+			ID       string `json:"id"`
+			Services []struct {
+				ID        string `json:"id"`
+				Endpoints []struct {
+					ID            string `json:"id"`
+					EndpointState string `json:"endpointState"`
+					TunnelState   string `json:"tunnelState"`
+					LocalURL      string `json:"localUrl"`
+				} `json:"endpoints"`
+			} `json:"services"`
+		} `json:"environments"`
+	}
+	if err := json.Unmarshal([]byte(harness.Get(t, apiURL+"/v1/state")), &state); err != nil {
+		t.Fatalf("decode ensured endpoint from /v1/state: %v", err)
+	}
+	for _, environment := range state.Environments {
+		if environment.ID != environmentID {
+			continue
+		}
+		for _, service := range environment.Services {
+			if service.ID != serviceID {
+				continue
+			}
+			for _, endpoint := range service.Endpoints {
+				if endpoint.ID != endpointID {
+					continue
+				}
+				parsed, err := url.Parse(endpoint.LocalURL)
+				if err != nil || parsed.Scheme != "http" || parsed.Hostname() != "127.0.0.1" || parsed.Port() == "" {
+					t.Fatalf("v1 endpoint projection returned a non-loopback URL %q (%v)", endpoint.LocalURL, err)
+				}
+				if endpoint.EndpointState != "available" || endpoint.TunnelState != "ready" {
+					t.Fatalf("v1 endpoint projection is not locally ready: %#v", endpoint)
+				}
+				return strings.TrimRight(endpoint.LocalURL, "/")
+			}
+		}
+	}
+	t.Fatalf("/v1/state omitted endpoint %s/%s/%s", environmentID, serviceID, endpointID)
+	return ""
 }
 
 func formToken(t *testing.T, uiURL string) string {

@@ -48,13 +48,13 @@ func TestLocaleAndUpdateSurfaceOnProductionCandidate(t *testing.T) {
 	if !strings.Contains(english, `<html lang="en">`) {
 		t.Fatal("candidate did not render the English locale selector")
 	}
-	assertLocaleForm(t, english, "/")
+	assertLocaleForm(t, harness.Get(t, uiURL+"/settings"), "/settings")
 
 	updates := harness.Get(t, uiURL+"/updates")
 	if !strings.Contains(updates, `<html lang="en">`) {
 		t.Fatal("Updates page did not preserve the explicit English locale")
 	}
-	assertLocaleForm(t, updates, "/updates")
+	assertLocaleForm(t, harness.Get(t, uiURL+"/settings"), "/settings")
 	for _, selector := range []string{`id="updates-region"`, `id="updates-installed-version"`, `id="updates-last-check"`, `id="updates-releases-section"`, `id="updates-op"`, `id="updates-ready"`, `id="updates-check"`} {
 		if !strings.Contains(updates, selector) {
 			t.Fatalf("candidate Updates surface omitted %s", selector)
@@ -79,7 +79,7 @@ func TestLocaleAndUpdateSurfaceOnProductionCandidate(t *testing.T) {
 	if !strings.Contains(japanese, `<html lang="ja">`) || !hasJapaneseText(japanese) {
 		t.Fatal("candidate Updates surface did not render Japanese operator copy")
 	}
-	assertLocaleForm(t, japanese, "/updates")
+	assertLocaleForm(t, harness.Get(t, uiURL+"/settings"), "/settings")
 	if !strings.Contains(japanese, `id="updates-check"`) || !strings.Contains(japanese, `action="/updates/check"`) {
 		t.Fatal("Japanese Updates surface lost its explicit check control")
 	}

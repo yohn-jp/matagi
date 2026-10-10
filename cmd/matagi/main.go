@@ -158,9 +158,24 @@ func runDesktop(parent context.Context, rt lifecycle, platform desktop.Platform)
 	if err != nil {
 		return closeRuntime(rt, err)
 	}
+	var presentationHost *desktopPresentation
+	if goruntime.GOOS == "windows" {
+		cacheRoot, err := os.UserCacheDir()
+		if err != nil {
+			return closeRuntime(rt, fmt.Errorf("locating WebView2 profile: %w", err))
+		}
+		presentationHost, err = newDesktopPresentation(ctx, client, prefs, stateRoot, cacheRoot)
+		if err != nil {
+			return closeRuntime(rt, err)
+		}
+	}
 	updates := newDesktopUpdates(stateRoot, prefs, stop)
 	apiServer := &http.Server{Handler: api.NewWithCapability(rt, capability), ReadHeaderTimeout: 5 * time.Second}
-	uiServer := &http.Server{Handler: ui.NewHandlerWithOptions(client, policy, ui.Options{Settings: prefs, Updates: updates}), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 15 * time.Second}
+	uiOptions := ui.Options{Settings: prefs, Updates: updates}
+	if presentationHost != nil {
+		uiOptions.Presenter = presentationHost
+	}
+	uiServer := &http.Server{Handler: ui.NewHandlerWithOptions(client, policy, uiOptions), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 15 * time.Second}
 	results := make(chan error, 3)
 	go func() { results <- rt.Run(ctx) }()
 	go func() {
@@ -179,6 +194,10 @@ func runDesktop(parent context.Context, rt lifecycle, platform desktop.Platform)
 	}()
 	windowDone := make(chan error, 1)
 	go func() {
+		if presentationHost != nil {
+			windowDone <- presentationHost.Run(ctx, uiURL)
+			return
+		}
 		cache, err := os.UserCacheDir()
 		if err != nil {
 			windowDone <- fmt.Errorf("locating WebView2 profile: %w", err)
@@ -199,6 +218,10 @@ func runDesktop(parent context.Context, rt lifecycle, platform desktop.Platform)
 	stop()
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if presentationHost != nil {
+		presentationHost.Stop()
+		result = errors.Join(result, presentationHost.CloseAll(shutdown))
+	}
 	// Stop accepting requests before closing the runtime and its owned tunnels.
 	result = errors.Join(result, uiServer.Shutdown(shutdown), apiServer.Shutdown(shutdown))
 	for i := 0; i < remainingServers; i++ {
